@@ -1,0 +1,2843 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Deli-Lunch · Pedidos</title>
+<link rel="icon" href="data:,">
+</head>
+<body style="margin:0;">
+<div id="root"></div>
+
+<!-- React, ReactDOM y Babel (para poder usar JSX directo en el navegador) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+<!-- Firebase (Realtime Database): sincroniza los pedidos entre todos los dispositivos -->
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
+
+<script>
+  // ── Base de datos en la nube (Firebase Realtime Database) ──
+  // Todos los dispositivos que abran esta app y usen este mismo proyecto de
+  // Firebase verán y editarán los mismos datos, en tiempo real.
+  const firebaseConfig = {
+    apiKey: "AIzaSyBo9N28RyazORtb-UIpLx4k9TsedYu874E",
+    authDomain: "deli-lunch-5a358.firebaseapp.com",
+    databaseURL: "https://deli-lunch-5a358-default-rtdb.firebaseio.com",
+    projectId: "deli-lunch-5a358",
+    storageBucket: "deli-lunch-5a358.firebasestorage.app",
+    messagingSenderId: "1096222377340",
+    appId: "1:1096222377340:web:6bb4af5e7d09ac56cdd0f9",
+  };
+  firebase.initializeApp(firebaseConfig);
+  const firebaseDB = firebase.database();
+
+  window.storage = {
+    // Escucha cambios en vivo. onChange se llama cada vez que hay datos nuevos
+    // (los propios o los de cualquier otro dispositivo conectado).
+    subscribe(key, onChange, onError) {
+      const ref = firebaseDB.ref(key);
+      const listener = ref.on(
+        "value",
+        (snap) => onChange(snap.exists() ? { key, value: snap.val() } : null),
+        (err) => onError && onError(err)
+      );
+      return () => ref.off("value", listener);
+    },
+    async set(key, value) {
+      await firebaseDB.ref(key).set(value);
+      return { key, value };
+    },
+  };
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect } = React;
+
+// ── Identidad Deli-Lunch (tomada del menú semanal) ──────────────
+const C = {
+  cream: "#FBF6EC",
+  pink: "#F7BCC8",
+  pinkSoft: "#FBDDE4",
+  lavender: "#C9A6DA",
+  lavSoft: "#EADFF2",
+  mustard: "#E3A62F",
+  teal: "#A8CFC6",
+  plum: "#8B1E5B",
+  ink: "#3A2B3F",
+  white: "#FFFFFF",
+  ok: "#4C9A6E",
+};
+
+// Convierte un color hex ("#RRGGBB") a un arreglo [r,g,b] para usarlo con jsPDF
+const hexRGB = (hex) => {
+  const h = (hex || "#000000").replace("#", "");
+  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+};
+const RGB = {
+  plum: hexRGB(C.plum), mustard: hexRGB(C.mustard), lavender: hexRGB(C.lavender), pink: hexRGB(C.pink),
+  pinkSoft: hexRGB(C.pinkSoft), lavSoft: hexRGB(C.lavSoft), teal: hexRGB(C.teal), cream: hexRGB(C.cream),
+  ink: hexRGB(C.ink), ok: hexRGB(C.ok), white: [255, 255, 255], gray: [90, 82, 94], grayLight: [150, 138, 156],
+  tealOscuro: hexRGB("#3E7A6C"), pinkOscuro: hexRGB("#B0486B"),
+};
+
+const DIAS = [
+  { key: "lun", label: "Lunes" },
+  { key: "mar", label: "Martes" },
+  { key: "mie", label: "Miércoles" },
+  { key: "jue", label: "Jueves" },
+  { key: "vie", label: "Viernes" },
+];
+
+// Ordena listas de grados de texto libre en orden natural (1, 2, 10... no alfabético)
+const ordenarGrados = (lista) => [...lista].sort((a, b) => a.localeCompare(b, "es", { numeric: true, sensitivity: "base" }));
+
+// Compara dos grados para ordenar; los vacíos ("sin grado") van al final
+const compararGrado = (a, b) => {
+  const ga = (a || "").trim(), gb = (b || "").trim();
+  if (!ga && !gb) return 0;
+  if (!ga) return 1;
+  if (!gb) return -1;
+  return ga.localeCompare(gb, "es", { numeric: true, sensitivity: "base" });
+};
+
+// Normaliza texto para comparar clientes: sin mayúsculas, acentos, espacios dobles ni símbolos de grado
+const normalizarTexto = (t) => (t || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
+const normalizarGrado = (g) => normalizarTexto(g).replace(/[°º.\-\s]/g, "").replace(/(grado|grupo)/g, "");
+
+// Genera la clave única de cliente = nombre + grado.
+// Si un registro NO tiene grado y ese nombre aparece con UN SOLO grado en la semana, se une a ese cliente;
+// si el nombre existe en varios grados, el registro sin grado queda aparte (para no mezclar alumnos distintos).
+const claveClienteFactory = (registros) => {
+  const gradosPorNombre = {};
+  registros.forEach((p) => {
+    const n = normalizarTexto(p.nombre), g = normalizarGrado(p.grado);
+    if (!n || !g) return;
+    (gradosPorNombre[n] = gradosPorNombre[n] || new Set()).add(g);
+  });
+  return (p) => {
+    const n = normalizarTexto(p.nombre);
+    if (!n) return "";
+    let g = normalizarGrado(p.grado);
+    if (!g && gradosPorNombre[n] && gradosPorNombre[n].size === 1) g = [...gradosPorNombre[n]][0];
+    return `${n}|${g}`;
+  };
+};
+
+// La fuente del PDF (Helvetica) solo trae letras latinas: los emojis (🎉 🌮 ✓…) salen como "Ø<ß‰".
+// Se quitan del texto antes de dibujarlo; los acentos y la ñ sí se conservan.
+const limpiarTextoPDF = (t) => String(t ?? "")
+  .replace(/✓/g, "")
+  .replace(/[^\u0000-\u00FF\u2013\u2014\u2018\u2019\u201C\u201D\u2022\u2026]/g, "")
+  .replace(/\s{2,}/g, " ")
+  .trim();
+const nuevoDocPDF = () => {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "pt", format: "letter" });
+  const textoOriginal = doc.text.bind(doc);
+  const partirOriginal = doc.splitTextToSize.bind(doc);
+  const anchoOriginal = doc.getTextWidth.bind(doc);
+  doc.text = (texto, ...resto) => textoOriginal(Array.isArray(texto) ? texto.map(limpiarTextoPDF) : limpiarTextoPDF(texto), ...resto);
+  doc.splitTextToSize = (texto, ...resto) => partirOriginal(limpiarTextoPDF(texto), ...resto);
+  doc.getTextWidth = (texto) => anchoOriginal(limpiarTextoPDF(texto));
+  return doc;
+};
+
+const formatoFolio = (n) => `DL-${String(n).padStart(5, "0")}`;
+
+const PAQUETES = [
+  { key: "solo", label: "Solo desayuno" },
+  { key: "postre", label: "Desayuno y postre" },
+  { key: "completo", label: "Desayuno completo" },
+];
+// Paquete usado solo en pedidos antiguos (ya no se ofrece como opción de día,
+// pero se conserva aquí para poder seguir mostrando semanas archivadas).
+const PAQUETE_AGUA_LEGACY = { key: "agua", label: "Agua embotellada 500ml" };
+const PAQUETES_TODOS = [...PAQUETES, PAQUETE_AGUA_LEGACY];
+
+const MENU_INICIAL = {
+  semana: "Semana del 01 al 05",
+  platillos: {
+    lun: { plato: "Huevo con salchicha, frijoles y totopos", postre: "Yogurt con cereal o granola", bebida: "Agua natural" },
+    mar: { plato: "Dorados de pollo o papa 🌮", postre: "Fruta fresca", bebida: "Agua natural" },
+    mie: { plato: "Espagueti con albondiguitas", postre: "Gelatina", bebida: "Agua natural" },
+    jue: { plato: "Sincronizada", postre: "Jícama loca", bebida: "Agua natural" },
+    vie: { plato: "Hot cakes con atole de chocolate", postre: "Fruta", bebida: "Agua de horchata" },
+  },
+  precios: { solo: 35, postre: 40, completo: 45, aguaBotella: 10, agua1L: 15, soloPostre: 10, lechita: 12, jugo500: 15, descuentoAnticipado: 5, comisionTapToPay: 3.5 },
+};
+
+// ── Club de Tareas: menú independiente de snacks ──────────────
+const CLUB_ARTICULOS = [
+  { key: "quesadilla", label: "Quesadilla" },
+  { key: "quesoPulpos", label: "Queso-pulpos" },
+  { key: "hotdog", label: "Hot Dog" },
+  { key: "salchipulpos", label: "Salchipulpos" },
+  { key: "sandwichJamon", label: "Sandwich de jamón" },
+  { key: "sandwichHuevo", label: "Sandwich de huevo" },
+  { key: "sincronizada", label: "Sincronizada" },
+  { key: "pechuga", label: "Pechuga asada c/verduras" },
+];
+const CLUB_BEBIDAS = [
+  { key: "agua500", label: "Agua embotellada 500ml" },
+  { key: "agua1l", label: "Agua 1 Litro" },
+  { key: "boing", label: "Boing 500ml" },
+];
+const CLUB_VASOS = [
+  { key: "zanahoria", label: "Vaso 8oz · Zanahoria" },
+  { key: "pepino", label: "Vaso 8oz · Pepino" },
+  { key: "jicama", label: "Vaso 8oz · Jícama" },
+  { key: "mixto", label: "Vaso 8oz · Mixto" },
+];
+const CLUB_ITEMS = [...CLUB_ARTICULOS, ...CLUB_BEBIDAS, ...CLUB_VASOS];
+
+const CLUB_PRECIOS_INICIAL = {
+  quesadilla: 15, quesoPulpos: 25, hotdog: 25, salchipulpos: 25,
+  sandwichJamon: 30, sandwichHuevo: 30, sincronizada: 35, pechuga: 45,
+  agua500: 10, agua1l: 15, boing: 20,
+  zanahoria: 18, pepino: 18, jicama: 18, mixto: 18,
+};
+
+const clubPedidoVacio = () => ({
+  id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+  nombre: "",
+  grado: "",
+  items: {},
+  pago: "Efectivo",
+  pagado: false,
+  notas: "",
+  creado: new Date().toISOString(),
+});
+
+const KEY = "delilunch-datos-v1";
+
+const MENU_FESTIVO_INICIAL = { nombre: "Menú festivo", platillos: ["Platillo 1"], precio: 0, fecha: "" };
+
+// Fechas del menú festivo: se guardan como "AAAA-MM-DD" (sin hora, para evitar desfases de zona horaria)
+const hoyISO = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+const formatoFechaDia = (iso) => {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("es-MX", { day: "numeric", month: "short" }).replace(".", "");
+};
+const formatoFechaCorta = (iso) => {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("es-MX", { weekday: "long", day: "numeric", month: "long" });
+};
+
+const festivoPedidoVacio = () => ({
+  id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+  nombre: "",
+  grado: "",
+  platillos: {}, // { "Nombre del platillo": cantidad }
+  pago: "Efectivo",
+  pagado: false,
+  notas: "",
+  creado: new Date().toISOString(),
+});
+
+// Cantidad total de menús de un pedido festivo (compatible con pedidos antiguos que solo guardaban "qty")
+const festivoCantidadTotal = (p) =>
+  p && p.platillos && Object.keys(p.platillos).length
+    ? Object.values(p.platillos).reduce((a, b) => a + (b || 0), 0)
+    : (p?.qty || 0);
+
+const pedidoVacio = () => ({
+  id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+  nombre: "",
+  telefono: "",
+  grado: "",
+  qty: 1,
+  dias: { lun: null, mar: null, mie: null, jue: null, vie: null },
+  extras: { botellas: 0, litros: 0, postres: 0, lechitas: 0, jugos: 0, variosDesc: "", variosMonto: 0 },
+  pago: "Efectivo",
+  pagado: false,
+  anticipado: false,
+  entregado: {},
+  notas: "",
+  creado: new Date().toISOString(),
+});
+
+function calcularResumenSemana(menuData, pedidosData, clubPreciosData, clubPedidosData, menuFestivoData = MENU_FESTIVO_INICIAL, festivoPedidosData = []) {
+  const precioDe = (pkg) => (menuData.precios || {})[pkg] || 0;
+  const descuentoPct = (menuData.precios || {}).descuentoAnticipado || 0;
+  const comisionPct = (menuData.precios || {}).comisionTapToPay || 0;
+  const factorAnticipado = (p) => (p.anticipado ? 1 - descuentoPct / 100 : 1);
+  const factorTapToPay = (p) => (p.pago === "Tap to Pay" ? 1 + comisionPct / 100 : 1);
+  const resumenDia = (d, gradoFiltro = null) => {
+    let desayunos = 0, postres = 0, aguas = 0, ingreso = 0;
+    pedidosData.forEach((p) => {
+      if (gradoFiltro && (p.grado || "").trim() !== gradoFiltro) return;
+      const pkg = p.dias[d];
+      if (!pkg) return;
+      if (pkg !== "agua") desayunos += p.qty;
+      if (pkg === "postre" || pkg === "completo") postres += p.qty;
+      if (pkg === "agua" || pkg === "completo") aguas += p.qty;
+      ingreso += precioDe(pkg) * p.qty * factorAnticipado(p) * factorTapToPay(p);
+    });
+    return { desayunos, postres, aguas, ingreso: Math.round(ingreso) };
+  };
+  const extrasTot = pedidosData.reduce(
+    (a, p) => ({
+      botellas: a.botellas + (p.extras?.botellas || 0),
+      litros: a.litros + (p.extras?.litros || 0),
+      postres: a.postres + (p.extras?.postres || 0),
+      lechitas: a.lechitas + (p.extras?.lechitas || 0),
+      jugos: a.jugos + (p.extras?.jugos || 0),
+      variosMonto: a.variosMonto + (p.extras?.variosMonto || 0),
+    }),
+    { botellas: 0, litros: 0, postres: 0, lechitas: 0, jugos: 0, variosMonto: 0 }
+  );
+  // Subtotal antes de la comisión de Tap to Pay (ya con el descuento por pago anticipado aplicado)
+  const subtotalPedido = (p) => {
+    let t = 0;
+    DIAS.forEach(({ key }) => { if (p.dias[key]) t += precioDe(p.dias[key]) * p.qty; });
+    t += (p.extras?.botellas || 0) * (menuData.precios?.aguaBotella || 0) + (p.extras?.litros || 0) * (menuData.precios?.agua1L || 0)
+      + (p.extras?.postres || 0) * (menuData.precios?.soloPostre || 0)
+      + (p.extras?.lechitas || 0) * (menuData.precios?.lechita || 0) + (p.extras?.jugos || 0) * (menuData.precios?.jugo500 || 0)
+      + (p.extras?.variosMonto || 0);
+    return t * factorAnticipado(p);
+  };
+  // Comisión de Tap to Pay: se le suma al cliente (no la absorbe el negocio)
+  const comisionPedidoDe = (p) => (p.pago === "Tap to Pay" ? Math.round(subtotalPedido(p) * comisionPct / 100) : 0);
+  const totalPedido = (p) => Math.round(subtotalPedido(p)) + comisionPedidoDe(p);
+  const ingresoSemana = pedidosData.reduce((a, p) => a + totalPedido(p), 0);
+  const porPago = pedidosData.reduce((a, p) => { a[p.pago] = (a[p.pago] || 0) + totalPedido(p); return a; }, {});
+  const pendienteCobro = pedidosData.filter((p) => !p.pagado).reduce((a, p) => a + totalPedido(p), 0);
+
+  const subtotalClub = (p) =>
+    CLUB_ITEMS.reduce((t, it) => t + (p.items?.[it.key] || 0) * ((clubPreciosData || {})[it.key] || 0), 0);
+  const comisionClubDe = (p) => (p.pago === "Tap to Pay" ? Math.round(subtotalClub(p) * comisionPct / 100) : 0);
+  const totalClub = (p) => Math.round(subtotalClub(p)) + comisionClubDe(p);
+  const clubCantidades = CLUB_ITEMS.reduce((acc, it) => {
+    acc[it.key] = clubPedidosData.reduce((a, p) => a + (p.items?.[it.key] || 0), 0);
+    return acc;
+  }, {});
+  const clubIngreso = clubPedidosData.reduce((a, p) => a + totalClub(p), 0);
+  const clubPorPago = clubPedidosData.reduce((a, p) => { a[p.pago] = (a[p.pago] || 0) + totalClub(p); return a; }, {});
+  const clubPendiente = clubPedidosData.filter((p) => !p.pagado).reduce((a, p) => a + totalClub(p), 0);
+
+  const subtotalFestivo = (p) => (menuFestivoData?.precio || 0) * festivoCantidadTotal(p);
+  const comisionFestivoDe = (p) => (p.pago === "Tap to Pay" ? Math.round(subtotalFestivo(p) * comisionPct / 100) : 0);
+  const totalFestivo = (p) => Math.round(subtotalFestivo(p)) + comisionFestivoDe(p);
+  const festivoIngreso = festivoPedidosData.reduce((a, p) => a + totalFestivo(p), 0);
+  const festivoPorPago = festivoPedidosData.reduce((a, p) => { a[p.pago] = (a[p.pago] || 0) + totalFestivo(p); return a; }, {});
+  const festivoRecaudado = festivoPedidosData.filter((p) => p.pagado).reduce((a, p) => a + totalFestivo(p), 0);
+  const festivoPendiente = festivoPedidosData.filter((p) => !p.pagado).reduce((a, p) => a + totalFestivo(p), 0);
+  // ── Conteo independiente de cada platillo festivo agregado ──
+  const festivoNombresPlatillos = (menuFestivoData?.platillos || []).map((pl) => (pl || "").trim()).filter(Boolean);
+  const festivoCantidades = festivoNombresPlatillos.reduce((acc, nombrePl) => {
+    acc[nombrePl] = festivoPedidosData.reduce((a, p) => a + (p.platillos?.[nombrePl] || 0), 0);
+    return acc;
+  }, {});
+  const recaudadoSemana = pedidosData.filter((p) => p.pagado).reduce((a, p) => a + totalPedido(p), 0);
+  const clubRecaudado = clubPedidosData.filter((p) => p.pagado).reduce((a, p) => a + totalClub(p), 0);
+
+  // ── Comisión de Tap to Pay ya incluida en los totales de arriba (se la cobra al cliente) ──
+  const comisionSemana = pedidosData.reduce((a, p) => a + comisionPedidoDe(p), 0);
+  const comisionClub = clubPedidosData.reduce((a, p) => a + comisionClubDe(p), 0);
+  const comisionFestivo = festivoPedidosData.reduce((a, p) => a + comisionFestivoDe(p), 0);
+
+  // ── Acumulados por grado (texto libre) ──
+  const gradosOrdenados = ordenarGrados(Array.from(new Set([
+    ...pedidosData.map((p) => (p.grado || "").trim()).filter(Boolean),
+    ...clubPedidosData.map((p) => (p.grado || "").trim()).filter(Boolean),
+    ...festivoPedidosData.map((p) => (p.grado || "").trim()).filter(Boolean),
+  ])));
+  const porGrado = gradosOrdenados.reduce((acc, gradoTxt) => {
+    const propios = pedidosData.filter((p) => (p.grado || "").trim() === gradoTxt);
+    const clubPropios = clubPedidosData.filter((p) => (p.grado || "").trim() === gradoTxt);
+    const festivoPropios = festivoPedidosData.filter((p) => (p.grado || "").trim() === gradoTxt);
+    const porDia = DIAS.reduce((accD, { key }) => {
+      accD[key] = resumenDia(key, gradoTxt);
+      return accD;
+    }, {});
+    const desayunos = propios.reduce((a, p) => a + DIAS.filter(({ key }) => p.dias[key] && p.dias[key] !== "agua").length * p.qty, 0);
+    const ingreso = propios.reduce((a, p) => a + totalPedido(p), 0);
+    const clubCantidadesG = CLUB_ITEMS.reduce((accI, it) => {
+      accI[it.key] = clubPropios.reduce((a, p) => a + (p.items?.[it.key] || 0), 0);
+      return accI;
+    }, {});
+    const clubIngresoG = clubPropios.reduce((a, p) => a + totalClub(p), 0);
+    const festivoIngresoG = festivoPropios.reduce((a, p) => a + totalFestivo(p), 0);
+    const festivoCantidadG = festivoPropios.reduce((a, p) => a + festivoCantidadTotal(p), 0);
+    const festivoCantidadesG = festivoNombresPlatillos.reduce((accI, nombrePl) => {
+      accI[nombrePl] = festivoPropios.reduce((a, p) => a + (p.platillos?.[nombrePl] || 0), 0);
+      return accI;
+    }, {});
+    const recaudadoG = propios.filter((p) => p.pagado).reduce((a, p) => a + totalPedido(p), 0)
+      + clubPropios.filter((p) => p.pagado).reduce((a, p) => a + totalClub(p), 0)
+      + festivoPropios.filter((p) => p.pagado).reduce((a, p) => a + totalFestivo(p), 0);
+    const pendienteG = propios.filter((p) => !p.pagado).reduce((a, p) => a + totalPedido(p), 0)
+      + clubPropios.filter((p) => !p.pagado).reduce((a, p) => a + totalClub(p), 0)
+      + festivoPropios.filter((p) => !p.pagado).reduce((a, p) => a + totalFestivo(p), 0);
+    // Recaudado/pendiente SIN festivo (para el Resumen general, que no mezcla festivos)
+    const recaudadoSinFestivoG = propios.filter((p) => p.pagado).reduce((a, p) => a + totalPedido(p), 0)
+      + clubPropios.filter((p) => p.pagado).reduce((a, p) => a + totalClub(p), 0);
+    const pendienteSinFestivoG = propios.filter((p) => !p.pagado).reduce((a, p) => a + totalPedido(p), 0)
+      + clubPropios.filter((p) => !p.pagado).reduce((a, p) => a + totalClub(p), 0);
+    acc[gradoTxt] = {
+      pedidos: propios.length, desayunos, ingreso, porDia, recaudado: recaudadoG, pendiente: pendienteG,
+      recaudadoSinFestivo: recaudadoSinFestivoG, pendienteSinFestivo: pendienteSinFestivoG,
+      clubPedidos: clubPropios.length, clubIngreso: clubIngresoG, clubCantidades: clubCantidadesG,
+      festivoPedidos: festivoPropios.length, festivoIngreso: festivoIngresoG, festivoCantidad: festivoCantidadG,
+      festivoCantidades: festivoCantidadesG,
+    };
+    return acc;
+  }, {});
+
+  // ── Total por cliente: junta Pedidos (desayuno) + Club de Tareas SOLO cuando coinciden NOMBRE y GRADO ──
+  // (hay alumnos con el mismo nombre en distintos grados; sin el grado se mezclaban sus cuentas)
+  // También junta el Menú festivo, para que la nota de consumo salga con TODO lo del cliente
+  const claveDe = claveClienteFactory([...pedidosData, ...clubPedidosData, ...festivoPedidosData]);
+  const nombresClientes = Array.from(new Set([
+    ...pedidosData.map(claveDe).filter(Boolean),
+    ...clubPedidosData.map(claveDe).filter(Boolean),
+    ...festivoPedidosData.map(claveDe).filter(Boolean),
+  ]));
+  const porCliente = nombresClientes.reduce((acc, clave) => {
+    const pedidosCliente = pedidosData.filter((p) => claveDe(p) === clave);
+    const clubCliente = clubPedidosData.filter((p) => claveDe(p) === clave);
+    const festivoCliente = festivoPedidosData.filter((p) => claveDe(p) === clave);
+    const nombreMostrar = (pedidosCliente[0]?.nombre || clubCliente[0]?.nombre || festivoCliente[0]?.nombre || clave).trim();
+    const gradoMostrar = (pedidosCliente.find((p) => (p.grado || "").trim())?.grado
+      || clubCliente.find((p) => (p.grado || "").trim())?.grado
+      || festivoCliente.find((p) => (p.grado || "").trim())?.grado || "").trim();
+    const totalPedidosC = pedidosCliente.reduce((a, p) => a + totalPedido(p), 0);
+    const totalClubC = clubCliente.reduce((a, p) => a + totalClub(p), 0);
+    const totalFestivoC = festivoCliente.reduce((a, p) => a + totalFestivo(p), 0);
+    const recaudadoC = pedidosCliente.filter((p) => p.pagado).reduce((a, p) => a + totalPedido(p), 0)
+      + clubCliente.filter((p) => p.pagado).reduce((a, p) => a + totalClub(p), 0)
+      + festivoCliente.filter((p) => p.pagado).reduce((a, p) => a + totalFestivo(p), 0);
+    const pendienteFestivoC = festivoCliente.filter((p) => !p.pagado).reduce((a, p) => a + totalFestivo(p), 0);
+    const pendienteC = pedidosCliente.filter((p) => !p.pagado).reduce((a, p) => a + totalPedido(p), 0)
+      + clubCliente.filter((p) => !p.pagado).reduce((a, p) => a + totalClub(p), 0)
+      + pendienteFestivoC;
+    const fuentes = [pedidosCliente.length > 0, clubCliente.length > 0, festivoCliente.length > 0].filter(Boolean).length;
+    acc[clave] = {
+      nombre: nombreMostrar, grado: gradoMostrar,
+      tienePedidos: pedidosCliente.length > 0, tieneClub: clubCliente.length > 0, tieneFestivo: festivoCliente.length > 0,
+      coincide: fuentes > 1,
+      totalPedidos: totalPedidosC, totalClub: totalClubC, totalFestivo: totalFestivoC,
+      total: totalPedidosC + totalClubC + totalFestivoC,
+      recaudado: recaudadoC, pendiente: pendienteC, pendienteFestivo: pendienteFestivoC,
+    };
+    return acc;
+  }, {});
+  // Orden: por grado (1°, 2°… y "sin grado" al final) y luego por nombre
+  const clientesOrdenados = nombresClientes
+    .sort((a, b) => compararGrado(porCliente[a].grado, porCliente[b].grado)
+      || porCliente[a].nombre.localeCompare(porCliente[b].nombre, "es", { sensitivity: "base" }));
+
+  return {
+    precioDe, resumenDia, extrasTot, totalPedido, ingresoSemana, porPago, pendienteCobro, recaudadoSemana,
+    totalClub, clubCantidades, clubIngreso, clubPorPago, clubPendiente, clubRecaudado, porGrado, gradosOrdenados,
+    totalFestivo, festivoIngreso, festivoPorPago, festivoPendiente, festivoRecaudado, festivoCantidades, festivoNombresPlatillos,
+    comisionPct, comisionSemana, comisionClub, comisionFestivo, comisionPedidoDe, comisionClubDe, comisionFestivoDe,
+    porCliente, clientesOrdenados, claveDe,
+  };
+}
+
+function DeliLunch() {
+  const [vista, setVista] = useState("resumen");
+  const [menu, setMenu] = useState(MENU_INICIAL);
+  const [pedidos, setPedidos] = useState([]);
+  const [clubPrecios, setClubPrecios] = useState(CLUB_PRECIOS_INICIAL);
+  const [clubPedidos, setClubPedidos] = useState([]);
+  const [cargando, setCargando] = useState(true);
+  const [aviso, setAviso] = useState("");
+  const [form, setForm] = useState(pedidoVacio());
+  const [editando, setEditando] = useState(null);
+  const [mostrarFormPedido, setMostrarFormPedido] = useState(false);
+  const [filtroDia, setFiltroDia] = useState("todos");
+  const [filtroGrado, setFiltroGrado] = useState("todos");
+  const [filtroGradoFestivo, setFiltroGradoFestivo] = useState("todos");
+  const [clubForm, setClubForm] = useState(clubPedidoVacio());
+  const [clubEditando, setClubEditando] = useState(null);
+  const [menuFestivo, setMenuFestivo] = useState(MENU_FESTIVO_INICIAL);
+  const [festivoPedidos, setFestivoPedidos] = useState([]);
+  const [festivoForm, setFestivoForm] = useState(festivoPedidoVacio());
+  const [festivoEditando, setFestivoEditando] = useState(null);
+  const [historial, setHistorial] = useState([]);
+  const [semanaAbierta, setSemanaAbierta] = useState(null);
+  const [tituloHist, setTituloHist] = useState(null); // texto en edición del nombre de una semana archivada
+  const [conectado, setConectado] = useState(true);
+  // Folios de las notas de consumo: consecutivo global + folio ya asignado a cada cliente en la semana actual
+  const [folios, setFolios] = useState({ siguiente: 1, asignados: {} });
+  // Estadística de ventas: vista semanal o mensual + periodo seleccionado
+  const [modoEstad, setModoEstad] = useState("semanal");
+  const [periodoSel, setPeriodoSel] = useState(null);
+
+  // ── Cargar datos y mantenerse sincronizado en tiempo real con Firebase ──
+  useEffect(() => {
+    const unsubscribe = window.storage.subscribe(
+      KEY,
+      (r) => {
+        if (r && r.value) {
+          try {
+            const d = JSON.parse(r.value);
+            if (d.menu) setMenu({ ...d.menu, precios: { ...MENU_INICIAL.precios, ...d.menu.precios } });
+            if (d.pedidos) setPedidos(d.pedidos);
+            if (d.clubPrecios) setClubPrecios({ ...CLUB_PRECIOS_INICIAL, ...d.clubPrecios });
+            if (d.clubPedidos) setClubPedidos(d.clubPedidos);
+            if (d.historial) setHistorial(d.historial);
+            if (d.menuFestivo) setMenuFestivo({ ...MENU_FESTIVO_INICIAL, ...d.menuFestivo });
+            if (d.festivoPedidos) setFestivoPedidos(d.festivoPedidos);
+            if (d.folios) setFolios({ siguiente: d.folios.siguiente || 1, asignados: d.folios.asignados || {} });
+          } catch (e) {
+            /* datos con formato inesperado: se ignoran */
+          }
+        }
+        setConectado(true);
+        setCargando(false);
+      },
+      () => {
+        setConectado(false);
+        setCargando(false);
+      }
+    );
+    return unsubscribe;
+  }, []);
+
+  const guardar = async (nuevoMenu, nuevosPedidos, nuevoClubPrecios, nuevosClubPedidos, nuevoHistorial, nuevoMenuFestivo, nuevosFestivoPedidos, nuevosFolios) => {
+    const m = nuevoMenu ?? menu;
+    const p = nuevosPedidos ?? pedidos;
+    const cp = nuevoClubPrecios ?? clubPrecios;
+    const cped = nuevosClubPedidos ?? clubPedidos;
+    const hist = nuevoHistorial ?? historial;
+    const mf = nuevoMenuFestivo ?? menuFestivo;
+    const fp = nuevosFestivoPedidos ?? festivoPedidos;
+    const fol = nuevosFolios ?? folios;
+    setMenu(m);
+    setPedidos(p);
+    setClubPrecios(cp);
+    setClubPedidos(cped);
+    setHistorial(hist);
+    setMenuFestivo(mf);
+    setFestivoPedidos(fp);
+    setFolios(fol);
+    try {
+      await window.storage.set(KEY, JSON.stringify({ menu: m, pedidos: p, clubPrecios: cp, clubPedidos: cped, historial: hist, menuFestivo: mf, festivoPedidos: fp, folios: fol }));
+      setConectado(true);
+      setAviso("Guardado ✓");
+      setTimeout(() => setAviso(""), 1500);
+    } catch (e) {
+      setConectado(false);
+      setAviso("Sin conexión: no se pudo guardar en la nube");
+      setTimeout(() => setAviso(""), 3000);
+    }
+  };
+
+  // ── Cálculos del resumen (semana actual) ──
+  const calc = calcularResumenSemana(menu, pedidos, clubPrecios, clubPedidos, menuFestivo, festivoPedidos);
+  const {
+    precioDe, resumenDia, extrasTot, totalPedido, ingresoSemana, porPago, pendienteCobro, recaudadoSemana,
+    totalClub, clubCantidades, clubIngreso, clubPorPago, clubPendiente, clubRecaudado, porGrado, gradosOrdenados,
+    totalFestivo, festivoIngreso, festivoPorPago, festivoPendiente, festivoRecaudado, festivoCantidades, festivoNombresPlatillos,
+    comisionPct, comisionSemana, comisionClub, comisionFestivo, comisionPedidoDe, comisionClubDe, comisionFestivoDe,
+    porCliente, clientesOrdenados, claveDe,
+  } = calc;
+
+  // ── Copiar resumen del día para WhatsApp ──
+  const textoDia = (key) => {
+    const r = resumenDia(key);
+    const label = DIAS.find((x) => x.key === key).label;
+    const lineas = [
+      `🍳 *Deli-Lunch · ${key === "mar" ? "Martes de tacos 🌮" : label}*`,
+      `${menu.platillos[key].plato}`,
+      ``,
+      `Para cocinar hoy:`,
+      `• ${r.desayunos} desayunos`,
+      `• ${r.postres} postres (${menu.platillos[key].postre})`,
+      `• ${r.aguas} aguas (${menu.platillos[key].bebida})`,
+    ];
+    lineas.push(``, `Pedidos:`);
+    pedidos
+      .filter((p) => p.dias[key])
+      .forEach((p) => {
+        const pq = PAQUETES_TODOS.find((q) => q.key === p.dias[key])?.label || "";
+        lineas.push(
+          `• ${p.nombre}${p.qty > 1 ? ` x${p.qty}` : ""} · ${pq}` +
+          (p.pagado ? " ✓ pagado" : ` · por cobrar (${p.pago.toLowerCase()})`)
+        );
+      });
+    lineas.push(``, `💰 Ingreso del día: $${r.ingreso}`);
+    return lineas.join("\n");
+  };
+
+  const copiarDia = async (key) => {
+    const texto = textoDia(key);
+    try {
+      await navigator.clipboard.writeText(texto);
+      setAviso("Resumen copiado ✓ pégalo en WhatsApp");
+    } catch (e) {
+      const ta = document.createElement("textarea");
+      ta.value = texto;
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        setAviso("Resumen copiado ✓ pégalo en WhatsApp");
+      } catch (e2) {
+        setAviso("No se pudo copiar en este dispositivo");
+      }
+      document.body.removeChild(ta);
+    }
+    setTimeout(() => setAviso(""), 2500);
+  };
+
+  // ── Utilidades visuales compartidas para los PDF (colores y bloques con estilo Deli-Lunch) ──
+  const crearContextoPDF = () => {
+    const doc = nuevoDocPDF();
+    const margen = 40;
+    const anchoPagina = doc.internal.pageSize.getWidth();
+    const altoPagina = doc.internal.pageSize.getHeight();
+    const anchoUtil = anchoPagina - margen * 2;
+    const ref = { y: 50 };
+    const setColor = (rgb) => doc.setTextColor(rgb[0], rgb[1], rgb[2]);
+    const setFill = (rgb) => doc.setFillColor(rgb[0], rgb[1], rgb[2]);
+    const setDraw = (rgb) => doc.setDrawColor(rgb[0], rgb[1], rgb[2]);
+    const salto = (extra = 18) => {
+      ref.y += extra;
+      if (ref.y > altoPagina - 60) { doc.addPage(); ref.y = 50; }
+    };
+
+    // Encabezado con banda de color Deli-Lunch
+    const encabezado = (titulo, subIzq = "", subDer = "") => {
+      setFill(RGB.plum);
+      doc.rect(0, 0, anchoPagina, 96, "F");
+      setFill(RGB.lavender);
+      doc.rect(0, 96, anchoPagina, 4, "F");
+      doc.setFont("helvetica", "bold"); doc.setFontSize(24); setColor(RGB.white);
+      doc.text("Deli-Lunch", margen, 46);
+      doc.setFont("helvetica", "bold"); doc.setFontSize(13); setColor(RGB.pinkSoft);
+      doc.text(titulo, margen, 68);
+      doc.setFont("helvetica", "normal"); doc.setFontSize(10); setColor(RGB.white);
+      if (subIzq) doc.text(subIzq, margen, 86);
+      if (subDer) doc.text(subDer, anchoPagina - margen, 86, { align: "right" });
+      ref.y = 124;
+    };
+
+    // Título de sección con "píldora" de color
+    const tituloSeccion = (texto, colorRGB = RGB.plum) => {
+      if (ref.y + 26 > altoPagina - 60) { doc.addPage(); ref.y = 50; }
+      doc.setFont("helvetica", "bold"); doc.setFontSize(10);
+      const anchoTexto = doc.getTextWidth(texto.toUpperCase());
+      setFill(colorRGB);
+      doc.roundedRect(margen, ref.y - 13, anchoTexto + 20, 20, 6, 6, "F");
+      setColor(RGB.white);
+      doc.text(texto.toUpperCase(), margen + 10, ref.y + 1);
+      ref.y += 22;
+    };
+
+    // Línea de texto simple (con salto de línea automático si es muy larga)
+    const filaTexto = (texto, opts = {}) => {
+      const { bold = false, size = 10, color = RGB.gray, indent = 0 } = opts;
+      doc.setFont("helvetica", bold ? "bold" : "normal"); doc.setFontSize(size); setColor(color);
+      const lineas = doc.splitTextToSize(texto, anchoUtil - indent);
+      if (ref.y + lineas.length * (size + 4) > altoPagina - 60) { doc.addPage(); ref.y = 50; }
+      doc.text(lineas, margen + indent, ref.y);
+      ref.y += lineas.length * (size + 4);
+    };
+
+    // Tarjeta de total con fondo de color (estilo de las tarjetas de la app)
+    const cajaTotal = (titulo, monto, chips = [], colorRGB = RGB.plum) => {
+      const alturaCaja = chips.length ? 70 : 52;
+      if (ref.y + alturaCaja > altoPagina - 50) { doc.addPage(); ref.y = 50; }
+      setFill(colorRGB);
+      doc.roundedRect(margen, ref.y, anchoUtil, alturaCaja, 10, 10, "F");
+      doc.setFont("helvetica", "bold"); doc.setFontSize(11); setColor(RGB.white);
+      doc.text(titulo, margen + 16, ref.y + 22);
+      doc.setFont("helvetica", "bold"); doc.setFontSize(20);
+      doc.text(`$${monto}`, margen + 16, ref.y + 44);
+      if (chips.length) {
+        doc.setFont("helvetica", "normal"); doc.setFontSize(9.5);
+        doc.text(chips.join("   ·   "), margen + 16, ref.y + 60);
+      }
+      ref.y += alturaCaja + 16;
+    };
+
+    // Tarjeta clara con borde suave (para pedidos individuales o grupos)
+    const tarjetaClara = (dibujar, alturaCaja) => {
+      if (ref.y + alturaCaja > altoPagina - 50) { doc.addPage(); ref.y = 50; }
+      setFill(RGB.cream); setDraw(RGB.lavSoft); doc.setLineWidth(1);
+      doc.roundedRect(margen, ref.y, anchoUtil, alturaCaja, 8, 8, "FD");
+      dibujar(ref.y);
+      ref.y += alturaCaja + 10;
+    };
+
+    const piePagina = () => {
+      const totalPaginas = doc.internal.getNumberOfPages();
+      for (let i = 1; i <= totalPaginas; i++) {
+        doc.setPage(i);
+        setColor(RGB.grayLight);
+        doc.setFont("helvetica", "normal"); doc.setFontSize(8);
+        doc.text(`Deli-Lunch · página ${i} de ${totalPaginas}`, anchoPagina / 2, altoPagina - 24, { align: "center" });
+      }
+    };
+
+    return {
+      doc, margen, anchoPagina, altoPagina, anchoUtil, ref, salto, setColor, setFill, setDraw,
+      encabezado, tituloSeccion, filaTexto, cajaTotal, tarjetaClara, piePagina,
+    };
+  };
+
+  // ── Descargar resumen semanal en PDF (semana actual o archivada) ──
+  const descargarPDF = (menuData = menu, calcData = calc, clubPedidosData = clubPedidos, subtitulo = "", festivoPedidosData = festivoPedidos, menuFestivoData = menuFestivo) => {
+    const { doc, margen, anchoPagina, altoPagina, anchoUtil, ref, setColor, setFill, setDraw, encabezado, tituloSeccion, filaTexto, cajaTotal, piePagina } = crearContextoPDF();
+
+    encabezado(`Resumen semanal${subtitulo}`, menuData.semana, `Generado el ${new Date().toLocaleDateString("es-MX")}`);
+
+    // ── Desayunos ──
+    tituloSeccion("Desayunos", RGB.plum);
+    DIAS.forEach(({ key, label }) => {
+      const r = calcData.resumenDia(key);
+      const esMartes = key === "mar";
+      filaTexto(`${esMartes ? "Martes de tacos 🌮" : label} — ${menuData.platillos[key].plato}`, { bold: true, size: 11, color: RGB.ink });
+      let linea1 = `${r.desayunos} desayunos · ${r.postres} postres · ${r.aguas} aguas`;
+      linea1 += ` · Ingreso: $${r.ingreso}`;
+      filaTexto(linea1, { indent: 10 });
+      ref.y += 4;
+    });
+    const extrasTotData = calcData.extrasTot;
+    if (extrasTotData.botellas || extrasTotData.litros || extrasTotData.postres || extrasTotData.lechitas || extrasTotData.jugos || extrasTotData.variosMonto) {
+      let lineaExtras = `Extras: ${extrasTotData.botellas} agua embotellada · ${extrasTotData.litros} agua 1L · ${extrasTotData.postres} solo postre · ${extrasTotData.lechitas} lechita · ${extrasTotData.jugos} jugo 500ml`;
+      if (extrasTotData.variosMonto) lineaExtras += ` · Varios: $${extrasTotData.variosMonto}`;
+      filaTexto(lineaExtras);
+      ref.y += 4;
+    }
+    ref.y += 4;
+    cajaTotal("Ingreso desayuno", calcData.ingresoSemana, [
+      `Recaudado $${calcData.recaudadoSemana}`, `Efectivo $${calcData.porPago["Efectivo"] || 0}`,
+      `Transferencia $${calcData.porPago["Transferencia"] || 0}`, `Tap to Pay $${calcData.porPago["Tap to Pay"] || 0}`,
+      `Por cobrar $${calcData.pendienteCobro}`,
+    ], RGB.plum);
+    if (calcData.comisionSemana > 0) filaTexto(`Incluye $${calcData.comisionSemana} de comisión Tap to Pay (${calcData.comisionPct}%) cobrada al cliente`, { color: RGB.gray });
+
+    // ── Club de Tareas ──
+    tituloSeccion("Club de Tareas", RGB.mustard);
+    if (clubPedidosData.length === 0) {
+      filaTexto("Sin pedidos esta semana.");
+      ref.y += 10;
+    } else {
+      CLUB_ITEMS.forEach((it) => {
+        if (calcData.clubCantidades[it.key] > 0) filaTexto(`• ${it.label}: ${calcData.clubCantidades[it.key]}`, { indent: 10 });
+      });
+      ref.y += 4;
+      cajaTotal("Ingreso Club de Tareas", calcData.clubIngreso, [
+        `Recaudado $${calcData.clubRecaudado}`, `Efectivo $${calcData.clubPorPago["Efectivo"] || 0}`,
+        `Transferencia $${calcData.clubPorPago["Transferencia"] || 0}`, `Tap to Pay $${calcData.clubPorPago["Tap to Pay"] || 0}`,
+        `Por cobrar $${calcData.clubPendiente}`,
+      ], RGB.mustard);
+      if (calcData.comisionClub > 0) filaTexto(`Incluye $${calcData.comisionClub} de comisión Tap to Pay (${calcData.comisionPct}%) cobrada al cliente`, { color: RGB.gray });
+    }
+
+    // ── Menú festivo ──
+    if (festivoPedidosData.length > 0) {
+      tituloSeccion(`Menú festivo — ${menuFestivoData.nombre || ""}`, RGB.lavender);
+      if (menuFestivoData.fecha) filaTexto(`Entrega: ${formatoFechaCorta(menuFestivoData.fecha)}`, { indent: 10, color: RGB.ink });
+      (calcData.festivoNombresPlatillos || []).forEach((nombrePl) => {
+        if (calcData.festivoCantidades?.[nombrePl] > 0) filaTexto(`• ${nombrePl}: ${calcData.festivoCantidades[nombrePl]}`, { indent: 10 });
+      });
+      const totalMenus = festivoPedidosData.reduce((a, p) => a + festivoCantidadTotal(p), 0);
+      filaTexto(`Total: ${totalMenus} menú(s) a $${menuFestivoData.precio || 0} c/u`, { indent: 10, bold: true, color: RGB.ink });
+      ref.y += 4;
+      cajaTotal("Ingreso Menú festivo", calcData.festivoIngreso, [
+        `Recaudado $${calcData.festivoRecaudado}`, `Efectivo $${calcData.festivoPorPago["Efectivo"] || 0}`,
+        `Transferencia $${calcData.festivoPorPago["Transferencia"] || 0}`, `Tap to Pay $${calcData.festivoPorPago["Tap to Pay"] || 0}`,
+        `Por cobrar $${calcData.festivoPendiente}`,
+      ], RGB.lavender);
+      if (calcData.comisionFestivo > 0) filaTexto(`Incluye $${calcData.comisionFestivo} de comisión Tap to Pay (${calcData.comisionPct}%) cobrada al cliente`, { color: RGB.gray });
+    }
+
+    // ── Por grado ──
+    const gradosConDatos = calcData.gradosOrdenados;
+    if (gradosConDatos.length > 0) {
+      tituloSeccion("Por grado", RGB.tealOscuro);
+      gradosConDatos.forEach((gradoTxt) => {
+        const pg = calcData.porGrado[gradoTxt];
+        const lineasExtra = [];
+        const porDiaTxt = DIAS.filter(({ key }) => pg.porDia[key].desayunos > 0)
+          .map(({ key, label }) => `${label.slice(0, 3)}: ${pg.porDia[key].desayunos}`).join(" · ");
+        if (porDiaTxt) lineasExtra.push(`Desayunos — ${porDiaTxt}`);
+        const clubTxt = CLUB_ITEMS.filter((it) => pg.clubCantidades[it.key] > 0)
+          .map((it) => `${pg.clubCantidades[it.key]} ${it.label}`).join(" · ");
+        if (clubTxt) lineasExtra.push(`Club de Tareas — ${clubTxt}`);
+        if (pg.festivoPedidos > 0) {
+          const festTxt = (calcData.festivoNombresPlatillos || []).filter((n) => pg.festivoCantidades?.[n] > 0)
+            .map((n) => `${pg.festivoCantidades[n]} ${n}`).join(" · ") || `${pg.festivoCantidad} menú(s)`;
+          lineasExtra.push(`Menú festivo — ${festTxt}`);
+        }
+        const lineasEnvueltas = lineasExtra.map((t) => doc.splitTextToSize(t, anchoUtil - 24));
+        const alturaExtra = lineasEnvueltas.reduce((a, ls) => a + ls.length * 12, 0);
+        const alturaCaja = 46 + alturaExtra;
+        if (ref.y + alturaCaja > altoPagina - 50) { doc.addPage(); ref.y = 50; }
+        setFill(RGB.cream); setDraw(RGB.lavSoft); doc.setLineWidth(1);
+        doc.roundedRect(margen, ref.y, anchoUtil, alturaCaja, 8, 8, "FD");
+        let yy = ref.y + 18;
+        doc.setFont("helvetica", "bold"); doc.setFontSize(11); setColor(RGB.ink);
+        doc.text(gradoTxt, margen + 12, yy);
+        doc.setFont("helvetica", "bold"); doc.setFontSize(11); setColor(RGB.plum);
+        doc.text(`$${pg.ingreso + pg.clubIngreso + pg.festivoIngreso}`, anchoPagina - margen - 12, yy, { align: "right" });
+        yy += 16;
+        doc.setFont("helvetica", "normal"); doc.setFontSize(9.5); setColor(RGB.ok);
+        doc.text(`Recaudado $${pg.recaudado}`, margen + 12, yy);
+        setColor(RGB.pinkOscuro);
+        doc.text(`Por cobrar $${pg.pendiente}`, margen + 150, yy);
+        yy += 16;
+        doc.setFont("helvetica", "normal"); doc.setFontSize(9); setColor(RGB.gray);
+        lineasEnvueltas.forEach((ls) => { doc.text(ls, margen + 12, yy); yy += ls.length * 12; });
+        ref.y += alturaCaja + 10;
+      });
+    }
+
+    // ── Total general ──
+    ref.y += 4;
+    cajaTotal("Total general de la semana", calcData.ingresoSemana + calcData.clubIngreso + calcData.festivoIngreso, [], RGB.plum);
+
+    piePagina();
+    doc.save(`Resumen-DeliLunch-${menuData.semana.replace(/\s+/g, "-")}.pdf`);
+  };
+
+  // ── Descargar PDF independiente del Menú festivo (ocasión actual o archivada) ──
+  const descargarPDFFestivo = (menuFestivoData = menuFestivo, calcData = calc, festivoPedidosData = festivoPedidos, subtitulo = "") => {
+    const { doc, margen, anchoPagina, altoPagina, anchoUtil, ref, setColor, setFill, setDraw, encabezado, tituloSeccion, filaTexto, cajaTotal, piePagina } = crearContextoPDF();
+
+    encabezado(`Menú festivo${subtitulo} — ${menuFestivoData.nombre || "Sin nombre"}`,
+      `${menuFestivoData.fecha ? `Entrega: ${formatoFechaCorta(menuFestivoData.fecha)} · ` : ""}Precio del menú completo: $${menuFestivoData.precio || 0}`,
+      `Generado el ${new Date().toLocaleDateString("es-MX")}`);
+
+    // ── Platillos del menú ──
+    tituloSeccion("Platillos del menú", RGB.lavender);
+    const platillosDelMenu = (menuFestivoData.platillos || []).map((pl) => (pl || "").trim()).filter(Boolean);
+    if (platillosDelMenu.length === 0) {
+      filaTexto("Sin platillos capturados.");
+    } else {
+      platillosDelMenu.forEach((pl) => filaTexto(`• ${pl}`, { indent: 10, color: RGB.ink }));
+    }
+    ref.y += 6;
+
+    // ── Conteo independiente de platillos pedidos ──
+    tituloSeccion("Conteo de platillos pedidos", RGB.mustard);
+    const nombresPl = calcData.festivoNombresPlatillos || [];
+    const hayConteo = nombresPl.some((n) => calcData.festivoCantidades?.[n] > 0);
+    if (!hayConteo) {
+      filaTexto("Aún no hay pedidos festivos.");
+    } else {
+      nombresPl.forEach((n) => {
+        if (calcData.festivoCantidades?.[n] > 0) filaTexto(`• ${n}: ${calcData.festivoCantidades[n]}`, { indent: 10 });
+      });
+      const totalMenus = festivoPedidosData.reduce((a, p) => a + festivoCantidadTotal(p), 0);
+      filaTexto(`Total: ${totalMenus} menú(s)`, { indent: 10, bold: true, color: RGB.ink });
+    }
+    ref.y += 6;
+
+    // ── Ingreso ──
+    cajaTotal("Ingreso Menú festivo", calcData.festivoIngreso, [
+      `Recaudado $${calcData.festivoRecaudado}`, `Efectivo $${calcData.festivoPorPago?.["Efectivo"] || 0}`,
+      `Transferencia $${calcData.festivoPorPago?.["Transferencia"] || 0}`, `Tap to Pay $${calcData.festivoPorPago?.["Tap to Pay"] || 0}`,
+      `Por cobrar $${calcData.festivoPendiente}`,
+    ], RGB.lavender);
+    if (calcData.comisionFestivo > 0) filaTexto(`Incluye $${calcData.comisionFestivo} de comisión Tap to Pay (${calcData.comisionPct}%) cobrada al cliente`, { color: RGB.gray });
+    ref.y += 6;
+
+    // ── Pedidos organizados por grado ──
+    tituloSeccion("Pedidos por grado", RGB.tealOscuro);
+    const gradosFestivoConDatos = ordenarGrados(Array.from(new Set(festivoPedidosData.map((p) => (p.grado || "").trim()).filter(Boolean))));
+    const sinGradoData = festivoPedidosData.filter((p) => !(p.grado || "").trim());
+    const gruposParaImprimir = [
+      ...gradosFestivoConDatos.map((gradoTxt) => ({ gradoTxt, propios: festivoPedidosData.filter((p) => (p.grado || "").trim() === gradoTxt) })),
+      ...(sinGradoData.length > 0 ? [{ gradoTxt: "Sin grado", propios: sinGradoData }] : []),
+    ];
+
+    if (gruposParaImprimir.length === 0) {
+      filaTexto("Aún no hay pedidos festivos.");
+    } else {
+      gruposParaImprimir.forEach(({ gradoTxt, propios }) => {
+        const ingresoG = propios.reduce((a, p) => a + calcData.totalFestivo(p), 0);
+        const recaudadoG = propios.filter((p) => p.pagado).reduce((a, p) => a + calcData.totalFestivo(p), 0);
+        const pendienteG = propios.filter((p) => !p.pagado).reduce((a, p) => a + calcData.totalFestivo(p), 0);
+
+        // Encabezado del grupo
+        if (ref.y + 24 > altoPagina - 60) { doc.addPage(); ref.y = 50; }
+        setFill(RGB.lavSoft);
+        doc.roundedRect(margen, ref.y - 12, anchoUtil, 22, 6, 6, "F");
+        doc.setFont("helvetica", "bold"); doc.setFontSize(11); setColor(RGB.plum);
+        doc.text(gradoTxt, margen + 10, ref.y + 3);
+        doc.setFont("helvetica", "normal"); doc.setFontSize(9);
+        setColor(RGB.ink);
+        doc.text(`Ingreso $${ingresoG}`, margen + anchoUtil * 0.42, ref.y + 3);
+        setColor(RGB.ok);
+        doc.text(`Recaudado $${recaudadoG}`, margen + anchoUtil * 0.62, ref.y + 3);
+        setColor(RGB.pinkOscuro);
+        doc.text(`Por cobrar $${pendienteG}`, margen + anchoUtil * 0.83, ref.y + 3);
+        ref.y += 20;
+
+        // Pedidos de ese grupo
+        propios.forEach((p) => {
+          const platillosTxt = p.platillos && Object.values(p.platillos).some((v) => v > 0)
+            ? Object.entries(p.platillos).filter(([, v]) => v > 0).map(([n, v]) => `${v} ${n}`).join(" · ")
+            : `x${p.qty || 1}`;
+          const alturaCaja = p.notas ? 58 : 46;
+          if (ref.y + alturaCaja > altoPagina - 50) { doc.addPage(); ref.y = 50; }
+          setFill(RGB.cream); setDraw(RGB.lavSoft); doc.setLineWidth(1);
+          doc.roundedRect(margen, ref.y, anchoUtil, alturaCaja, 8, 8, "FD");
+          doc.setFont("helvetica", "bold"); doc.setFontSize(11); setColor(RGB.ink);
+          doc.text(p.nombre, margen + 12, ref.y + 18);
+          doc.setFont("helvetica", "bold"); doc.setFontSize(11); setColor(RGB.plum);
+          doc.text(`$${calcData.totalFestivo(p)}`, anchoPagina - margen - 12, ref.y + 18, { align: "right" });
+          doc.setFont("helvetica", "normal"); doc.setFontSize(9); setColor(RGB.gray);
+          doc.text(platillosTxt, margen + 12, ref.y + 32);
+          doc.setFont("helvetica", "bold"); doc.setFontSize(9);
+          setColor(p.pagado ? RGB.ok : RGB.pinkOscuro);
+          doc.text(p.pagado ? "✓ Pagado" : `Por cobrar (${p.pago})`, anchoPagina - margen - 12, ref.y + 32, { align: "right" });
+          if (p.notas) {
+            doc.setFont("helvetica", "normal"); doc.setFontSize(8.5); setColor(RGB.grayLight);
+            doc.text(doc.splitTextToSize(p.notas, anchoUtil - 24), margen + 12, ref.y + 46);
+          }
+          ref.y += alturaCaja + 10;
+        });
+        ref.y += 4;
+      });
+    }
+
+    piePagina();
+    doc.save(`Menu-Festivo-DeliLunch-${(menuFestivoData.nombre || "menu-festivo").replace(/\s+/g, "-")}.pdf`);
+  };
+
+  // ── Descargar nota de consumo semanal de UN cliente, estilo "ticket" Deli-Lunch (Alumno/Grado/Fecha/Semana + tabla Producto/Precio/Cantidad/Total) ──
+  // Asigna folio (consecutivo) a los clientes que aún no tienen uno esta semana; guarda una sola vez
+  const asegurarFolios = (claves) => {
+    const asignados = { ...(folios.asignados || {}) };
+    let siguiente = folios.siguiente || 1;
+    let cambio = false;
+    claves.forEach((k) => {
+      if (!asignados[k]) { asignados[k] = siguiente++; cambio = true; }
+    });
+    if (cambio) guardar(null, null, null, null, null, null, null, { siguiente, asignados });
+    return asignados;
+  };
+
+  const descargarNotaCliente = (clave, folioDado) => {
+    const c = porCliente[clave];
+    if (!c) return;
+    const folioNum = folioDado || asegurarFolios([clave])[clave];
+    const folioTxt = formatoFolio(folioNum);
+    const pedidosCliente = pedidos.filter((p) => claveDe(p) === clave);
+    const clubCliente = clubPedidos.filter((p) => claveDe(p) === clave);
+    const festivoCliente = festivoPedidos.filter((p) => claveDe(p) === clave);
+
+    // ── Arma las filas de la tabla Producto / Precio / Cantidad / Total ──
+    const filas = [];
+    pedidosCliente.forEach((p) => {
+      const desdeAqui = filas.length;
+      DIAS.forEach(({ key, label }) => {
+        if (!p.dias[key]) return;
+        const pq = PAQUETES_TODOS.find((q) => q.key === p.dias[key]);
+        const precioUnit = precioDe(p.dias[key]);
+        filas.push({ producto: `${pq?.label || "Agua embotellada 500ml"} (${label})`, precio: precioUnit, cantidad: p.qty, total: Math.round(precioUnit * p.qty) });
+      });
+      if (p.extras?.botellas) filas.push({ producto: "Agua embotellada 500 ml", precio: menu.precios.aguaBotella || 0, cantidad: p.extras.botellas, total: Math.round((menu.precios.aguaBotella || 0) * p.extras.botellas) });
+      if (p.extras?.litros) filas.push({ producto: "Agua 1 litro", precio: menu.precios.agua1L || 0, cantidad: p.extras.litros, total: Math.round((menu.precios.agua1L || 0) * p.extras.litros) });
+      if (p.extras?.postres) filas.push({ producto: "Solo postre", precio: menu.precios.soloPostre || 0, cantidad: p.extras.postres, total: Math.round((menu.precios.soloPostre || 0) * p.extras.postres) });
+      if (p.extras?.lechitas) filas.push({ producto: "Lechita", precio: menu.precios.lechita || 0, cantidad: p.extras.lechitas, total: Math.round((menu.precios.lechita || 0) * p.extras.lechitas) });
+      if (p.extras?.jugos) filas.push({ producto: "Jugo 500 ml", precio: menu.precios.jugo500 || 0, cantidad: p.extras.jugos, total: Math.round((menu.precios.jugo500 || 0) * p.extras.jugos) });
+      if (p.extras?.variosMonto) filas.push({ producto: p.extras.variosDesc ? `Varios — ${p.extras.variosDesc}` : "Varios", precio: p.extras.variosMonto, cantidad: 1, total: p.extras.variosMonto });
+      const descuentoPct = menu.precios.descuentoAnticipado || 0;
+      if (p.anticipado && descuentoPct > 0) {
+        const brutoPedido = filas.slice(desdeAqui).reduce((a, f) => a + f.total, 0);
+        const descuentoMonto = Math.round(brutoPedido * descuentoPct / 100);
+        if (descuentoMonto > 0) filas.push({ producto: `Descuento pago anticipado (-${descuentoPct}%)`, precio: null, cantidad: null, total: -descuentoMonto });
+      }
+      const comisionP = comisionPedidoDe(p);
+      if (comisionP > 0) filas.push({ producto: `Comisión Tap to Pay (${comisionPct}%)`, precio: null, cantidad: null, total: comisionP });
+    });
+    clubCliente.forEach((p) => {
+      CLUB_ITEMS.forEach((it) => {
+        const cant = p.items?.[it.key] || 0;
+        if (!cant) return;
+        const precioUnit = (clubPrecios || {})[it.key] || 0;
+        filas.push({ producto: it.label, precio: precioUnit, cantidad: cant, total: Math.round(precioUnit * cant) });
+      });
+      const comisionC = comisionClubDe(p);
+      if (comisionC > 0) filas.push({ producto: `Comisión Tap to Pay (${comisionPct}%)`, precio: null, cantidad: null, total: comisionC });
+    });
+    festivoCliente.forEach((p) => {
+      const precioMenu = menuFestivo.precio || 0;
+      const ocasion = (menuFestivo.nombre || "Menú festivo").trim();
+      const dia = menuFestivo.fecha ? ` (${formatoFechaDia(menuFestivo.fecha)})` : "";
+      const entradas = p.platillos && Object.values(p.platillos).some((v) => v > 0)
+        ? Object.entries(p.platillos).filter(([, v]) => v > 0)
+        : [["Menú festivo", p.qty || 1]];
+      entradas.forEach(([nombrePl, cant]) => {
+        filas.push({ producto: `${ocasion}${dia} ${nombrePl}${p.pagado ? " · pagado" : ""}`, precio: precioMenu, cantidad: cant, total: Math.round(precioMenu * cant) });
+      });
+      const comisionF = comisionFestivoDe(p);
+      if (comisionF > 0) filas.push({ producto: `Comisión Tap to Pay (${comisionPct}%)`, precio: null, cantidad: null, total: comisionF });
+    });
+
+    const doc = nuevoDocPDF();
+    const margen = 40;
+    const anchoPagina = doc.internal.pageSize.getWidth();
+    const altoPagina = doc.internal.pageSize.getHeight();
+    const anchoUtil = anchoPagina - margen * 2;
+    const setColor = (rgb) => doc.setTextColor(rgb[0], rgb[1], rgb[2]);
+    const setFill = (rgb) => doc.setFillColor(rgb[0], rgb[1], rgb[2]);
+    const setDraw = (rgb) => doc.setDrawColor(rgb[0], rgb[1], rgb[2]);
+    const xPrecio = margen + anchoUtil * 0.60, xCantidad = margen + anchoUtil * 0.76, xTotal = anchoPagina - margen - 4;
+
+    // ── Encabezado: pastilla con el logo + "NOTA DE CONSUMO" ──
+    setFill(RGB.pinkSoft);
+    doc.roundedRect(margen, 40, 190, 64, 18, 18, "F");
+    doc.setFont("helvetica", "bold"); doc.setFontSize(24); setColor(RGB.plum);
+    doc.text("Deli-Lunch", margen + 95, 78, { align: "center" });
+    doc.setFont("helvetica", "bold"); doc.setFontSize(11); setColor(RGB.ink);
+    doc.text("NOTA DE CONSUMO", anchoPagina - margen, 58, { align: "right" });
+    doc.setFont("helvetica", "normal"); doc.setFontSize(9); setColor(RGB.gray);
+    doc.text(`Generado el ${new Date().toLocaleDateString("es-MX")}`, anchoPagina - margen, 72, { align: "right" });
+    // Folio de la nota
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10); setColor(RGB.plum);
+    const anchoFolio = doc.getTextWidth(`FOLIO: ${folioTxt}`) + 20;
+    setFill(RGB.lavSoft);
+    doc.roundedRect(anchoPagina - margen - anchoFolio, 80, anchoFolio, 20, 6, 6, "F");
+    doc.text(`FOLIO: ${folioTxt}`, anchoPagina - margen - 10, 94, { align: "right" });
+
+    // ── Caja de datos: Alumno / Fecha / Grado / Semana ──
+    let y = 122;
+    setFill(RGB.white); setDraw(RGB.pink); doc.setLineWidth(1.4);
+    doc.roundedRect(margen, y, anchoUtil, 70, 12, 12, "FD");
+    const colIzq = margen + 16, colDer = margen + anchoUtil / 2 + 8;
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10); setColor(RGB.ok);
+    doc.text("ALUMNO:", colIzq, y + 24);
+    doc.text("GRADO:", colIzq, y + 50);
+    doc.text("FECHA:", colDer, y + 24);
+    doc.text("SEMANA:", colDer, y + 50);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(11); setColor(RGB.ink);
+    doc.text(c.nombre, colIzq + 56, y + 24);
+    doc.text(c.grado || "—", colIzq + 56, y + 50);
+    doc.text(new Date().toLocaleDateString("es-MX"), colDer + 46, y + 24);
+    doc.text(doc.splitTextToSize(menu.semana || "", anchoUtil / 2 - 62), colDer + 56, y + 50);
+    y += 70 + 18;
+
+    // ── Barra de encabezado de la tabla ──
+    setFill(RGB.pinkSoft);
+    doc.roundedRect(margen, y, anchoUtil, 26, 6, 6, "F");
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10); setColor(RGB.plum);
+    doc.text("PRODUCTO", margen + 14, y + 17);
+    doc.text("PRECIO", xPrecio, y + 17, { align: "right" });
+    doc.text("CANTIDAD", xCantidad, y + 17, { align: "right" });
+    doc.text("TOTAL", xTotal, y + 17, { align: "right" });
+    y += 26;
+
+    // ── Cuerpo de la tabla (con salto de página si crece mucho) ──
+    const altoFila = 20;
+    const altoTabla = Math.max(filas.length * altoFila + 14, 70);
+    if (y + altoTabla > altoPagina - 170) { doc.addPage(); y = 50; }
+    setFill(RGB.white); setDraw(RGB.pink); doc.setLineWidth(1.4);
+    doc.roundedRect(margen, y, anchoUtil, altoTabla, 0, 0, "FD");
+    let yy = y + 18;
+    if (filas.length === 0) {
+      doc.setFont("helvetica", "italic"); doc.setFontSize(10); setColor(RGB.grayLight);
+      doc.text("Sin consumo capturado esta semana.", margen + 14, yy);
+    } else {
+      filas.forEach((f) => {
+        doc.setFont("helvetica", "normal"); doc.setFontSize(9.5); setColor(RGB.ink);
+        doc.text(doc.splitTextToSize(f.producto, xPrecio - margen - 24)[0] || f.producto, margen + 14, yy);
+        setColor(RGB.gray);
+        doc.text(f.precio != null ? `$${f.precio}` : "—", xPrecio, yy, { align: "right" });
+        doc.text(f.cantidad != null ? `${f.cantidad}` : "—", xCantidad, yy, { align: "right" });
+        doc.setFont("helvetica", "bold"); setColor(RGB.plum);
+        doc.text(f.total < 0 ? `-$${Math.abs(f.total)}` : `$${f.total}`, xTotal, yy, { align: "right" });
+        yy += altoFila;
+      });
+    }
+    y += altoTabla + 14;
+
+    // ── Total de la semana ──
+    doc.setFont("helvetica", "bold"); doc.setFontSize(13); setColor(RGB.ink);
+    doc.text("TOTAL:", xCantidad, y);
+    doc.setFontSize(15); setColor(RGB.plum);
+    doc.text(`$${c.total}`, xTotal, y, { align: "right" });
+    y += 22;
+
+    // ── Barras de estatus: Pagado / Pendiente de pago ──
+    setFill(c.recaudado > 0 ? RGB.teal : RGB.lavSoft);
+    doc.roundedRect(margen, y, anchoUtil, 28, 8, 8, "F");
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10.5); setColor(RGB.ink);
+    doc.text("PAGADO", margen + 14, y + 18);
+    doc.text(`$${c.recaudado}`, anchoPagina - margen - 14, y + 18, { align: "right" });
+    y += 34;
+    setFill(c.pendiente > 0 ? RGB.pink : RGB.lavSoft);
+    doc.roundedRect(margen, y, anchoUtil, 28, 8, 8, "F");
+    doc.setFont("helvetica", "bold"); doc.setFontSize(10.5); setColor(c.pendiente > 0 ? RGB.pinkOscuro : RGB.ink);
+    doc.text("PENDIENTE DE PAGO", margen + 14, y + 18);
+    doc.text(`$${c.pendiente}`, anchoPagina - margen - 14, y + 18, { align: "right" });
+    y += 50;
+
+    // ── Pie: datos de contacto + agradecimiento ──
+    doc.setFont("helvetica", "bold"); doc.setFontSize(13); setColor(RGB.plum);
+    doc.text("Adriana Soto", margen, y);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(10); setColor(RGB.gray);
+    doc.text("55 2561 5705", margen, y + 15);
+    doc.setFont("helvetica", "bolditalic"); doc.setFontSize(15); setColor(RGB.ink);
+    doc.text("¡Gracias por su preferencia!", anchoPagina / 2, y + 40, { align: "center" });
+
+    doc.save(`Nota-DeliLunch-${folioTxt}-${c.nombre.replace(/\s+/g, "-")}${c.grado ? "-" + c.grado.replace(/[^\w]+/g, "") : ""}.pdf`);
+  };
+
+  // ── Descargar SOLO el menú semanal en PNG (sin precios) ──
+  const descargarMenuPNG = async () => {
+    try {
+      await Promise.all([
+        document.fonts.load("700 30px Pacifico"),
+        document.fonts.load("900 20px Pacifico"),
+        document.fonts.load("900 20px Nunito"),
+        document.fonts.load("800 16px Nunito"),
+        document.fonts.load("400 15px Nunito"),
+      ]);
+    } catch (e) { /* si no cargan, se usa la fuente de respaldo */ }
+
+    const ancho = 900;
+    const pad = 44;
+    const anchoInterno = ancho - pad * 2;
+    const bordeCampo = "#E4D3E8";
+    const colorLabel = "#B9A6C2";
+
+    // Parte un texto en líneas que quepan en maxWidth (sin dibujar todavía, solo para medir)
+    const partirLineas = (ctx, texto, maxWidth) => {
+      const palabras = (texto || "").split(" ").filter(Boolean);
+      if (palabras.length === 0) return [""];
+      const lineas = [];
+      let actual = "";
+      palabras.forEach((palabra) => {
+        const prueba = actual ? `${actual} ${palabra}` : palabra;
+        if (ctx.measureText(prueba).width > maxWidth && actual) {
+          lineas.push(actual);
+          actual = palabra;
+        } else {
+          actual = prueba;
+        }
+      });
+      lineas.push(actual);
+      return lineas;
+    };
+
+    // "Caja de campo" con una mini-etiqueta (Platillo/Postre/Bebida) y el valor en negritas junto a ella
+    const medirCampoEtiquetado = (ctx, label, valor, wBox) => {
+      const padX = 18, padY = 15, lineHeight = 26, gap = 10;
+      ctx.font = "800 12px 'Nunito', sans-serif";
+      const anchoLabel = ctx.measureText(label.toUpperCase()).width;
+      ctx.font = "900 18px 'Nunito', sans-serif";
+      const anchoPrimeraLinea = Math.max(40, wBox - padX * 2 - anchoLabel - gap);
+      const anchoResto = wBox - padX * 2;
+      const palabras = (valor || "").split(" ").filter(Boolean);
+      const lineas = [];
+      let actual = "";
+      palabras.forEach((palabra, i) => {
+        const prueba = actual ? `${actual} ${palabra}` : palabra;
+        const maxAncho = lineas.length === 0 ? anchoPrimeraLinea : anchoResto;
+        if (ctx.measureText(prueba).width > maxAncho && actual) {
+          lineas.push(actual);
+          actual = palabra;
+        } else {
+          actual = prueba;
+        }
+      });
+      lineas.push(actual);
+      const alto = padY * 2 + lineas.length * lineHeight;
+      return { lineas, alto, padX, padY, lineHeight, gap, anchoLabel };
+    };
+
+    // Caja de campo grande sin etiqueta en línea (para "Nombre de la semana")
+    const medirValor = (ctx, valor, wBox, fontSize) => {
+      const padX = 20, padY = 16, lineHeight = fontSize + 8;
+      ctx.font = `900 ${fontSize}px 'Nunito', sans-serif`;
+      const lineas = partirLineas(ctx, valor, wBox - padX * 2);
+      const alto = padY * 2 + lineas.length * lineHeight;
+      return { lineas, alto, padX, padY, lineHeight };
+    };
+
+    // Contexto solo para medir (no se dibuja ni se agrega al DOM)
+    const medidor = document.createElement("canvas").getContext("2d");
+
+    const campoNombre = medirValor(medidor, menu.semana || "—", anchoInterno - 40, 22);
+
+    const padCard = 22;
+    const anchoDentroCard = anchoInterno - padCard * 2;
+    const anchoMitad = (anchoDentroCard - 16) / 2;
+    const barAltura = 42;
+    const gapBarCampo = 16;
+    const gapEntreCampos = 12;
+
+    const diasCalc = DIAS.map(({ key, label }) => {
+      const dia = menu.platillos[key] || { plato: "", postre: "", bebida: "" };
+      const esMartes = key === "mar";
+      const campoPlatillo = medirCampoEtiquetado(medidor, "Platillo", dia.plato, anchoDentroCard);
+      const campoPostre = medirCampoEtiquetado(medidor, "Postre", dia.postre, anchoMitad);
+      const campoBebida = medirCampoEtiquetado(medidor, "Bebida", dia.bebida, anchoMitad);
+      const altoInferior = Math.max(campoPostre.alto, campoBebida.alto);
+      const altoCard = barAltura + gapBarCampo + campoPlatillo.alto + gapEntreCampos + altoInferior + padCard;
+      return { key, label, esMartes, dia, campoPlatillo, campoPostre, campoBebida, altoInferior, altoCard };
+    });
+
+    const logoSize = 108;
+    const alturaHeader = logoSize;
+    const gapHeaderNombre = 26;
+    const alturaNombreCard = 22 + 10 + campoNombre.alto + 24;
+    const gapEntreCards = 18;
+    const alturaFooter = 90;
+
+    const alto = pad + alturaHeader + gapHeaderNombre + alturaNombreCard + gapEntreCards
+      + diasCalc.reduce((a, d) => a + d.altoCard + gapEntreCards, 0)
+      + alturaFooter + pad;
+
+    // ── Canvas final, ya con el alto correcto ──
+    const canvas = document.createElement("canvas");
+    const escala = 2;
+    canvas.width = ancho * escala;
+    canvas.height = alto * escala;
+    const ctx = canvas.getContext("2d");
+    ctx.scale(escala, escala);
+    ctx.textBaseline = "alphabetic";
+
+    ctx.fillStyle = C.cream;
+    ctx.fillRect(0, 0, ancho, alto);
+
+    const cajaRedonda = (x, yc, w, h, r) => {
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(x, yc, w, h, r); else ctx.rect(x, yc, w, h);
+    };
+
+    // ── Logo circular ──
+    const cx = pad + logoSize / 2;
+    const cy = pad + logoSize / 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, logoSize / 2, 0, Math.PI * 2);
+    ctx.fillStyle = "#FCE7EF";
+    ctx.fill();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = C.pink;
+    ctx.stroke();
+    ctx.textAlign = "center";
+    ctx.fillStyle = C.plum;
+    ctx.font = "700 16px 'Pacifico', cursive";
+    ctx.fillText("Deli-Lunch", cx, cy - 22);
+    ctx.beginPath();
+    ctx.arc(cx, cy + 4, 15, 0, Math.PI * 2);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = C.plum;
+    ctx.stroke();
+    ctx.font = "900 13px 'Nunito', sans-serif";
+    ctx.fillStyle = C.pink;
+    ctx.fillText("♥", cx, cy + 9);
+    ctx.font = "700 12px 'Pacifico', cursive";
+    ctx.fillStyle = C.plum;
+    ctx.fillText("Adriana Soto", cx, cy + 34);
+    ctx.textAlign = "left";
+
+    // ── Píldora de título ──
+    const xPill = pad + logoSize + 24;
+    const wPill = ancho - pad - xPill;
+    cajaRedonda(xPill, pad, wPill, logoSize, 26);
+    ctx.fillStyle = C.pinkSoft;
+    ctx.fill();
+    ctx.textAlign = "center";
+    ctx.fillStyle = C.plum;
+    ctx.font = "700 40px 'Pacifico', cursive";
+    ctx.fillText("Menú Semanal", xPill + wPill / 2, pad + logoSize / 2 + 14);
+    ctx.textAlign = "left";
+
+    // ── Dibuja una caja de campo con etiqueta en línea (Platillo/Postre/Bebida) ──
+    const dibujarCampoEtiquetado = (x, yc, w, label, campo) => {
+      cajaRedonda(x, yc, w, campo.alto, 12);
+      ctx.fillStyle = C.white;
+      ctx.fill();
+      ctx.lineWidth = 1.4;
+      ctx.strokeStyle = bordeCampo;
+      ctx.stroke();
+      const yBase = yc + campo.padY + 13;
+      ctx.font = "800 12px 'Nunito', sans-serif";
+      ctx.fillStyle = colorLabel;
+      ctx.fillText(label.toUpperCase(), x + campo.padX, yBase);
+      ctx.font = "900 18px 'Nunito', sans-serif";
+      ctx.fillStyle = C.ink;
+      campo.lineas.forEach((linea, i) => {
+        const xLinea = i === 0 ? x + campo.padX + campo.anchoLabel + campo.gap : x + campo.padX;
+        ctx.fillText(linea, xLinea, yBase + i * campo.lineHeight);
+      });
+    };
+
+    // ── Nombre de la semana ──
+    let y = pad + alturaHeader + gapHeaderNombre;
+    cajaRedonda(pad, y, anchoInterno, alturaNombreCard, 18);
+    ctx.fillStyle = C.white;
+    ctx.fill();
+    ctx.font = "800 13px 'Nunito', sans-serif";
+    ctx.fillStyle = C.plum;
+    ctx.fillText("NOMBRE DE LA SEMANA", pad + 20, y + 26);
+    const yCampoNombre = y + 40;
+    cajaRedonda(pad + 20, yCampoNombre, anchoInterno - 40, campoNombre.alto, 12);
+    ctx.fillStyle = C.white;
+    ctx.fill();
+    ctx.lineWidth = 1.4;
+    ctx.strokeStyle = bordeCampo;
+    ctx.stroke();
+    ctx.font = "900 22px 'Nunito', sans-serif";
+    ctx.fillStyle = C.ink;
+    campoNombre.lineas.forEach((linea, i) => {
+      ctx.fillText(linea, pad + 20 + campoNombre.padX, yCampoNombre + campoNombre.padY + 18 + i * campoNombre.lineHeight);
+    });
+    y += alturaNombreCard + gapEntreCards;
+
+    // ── Tarjetas por día ──
+    diasCalc.forEach((d) => {
+      const xCard = pad;
+      const wCard = anchoInterno;
+      cajaRedonda(xCard, y, wCard, d.altoCard, 18);
+      ctx.fillStyle = C.white;
+      ctx.fill();
+
+      // Barra superior de color (recortada a las esquinas redondeadas de la tarjeta)
+      ctx.save();
+      cajaRedonda(xCard, y, wCard, d.altoCard, 18);
+      ctx.clip();
+      ctx.fillStyle = d.esMartes ? C.mustard : C.pink;
+      ctx.fillRect(xCard, y, wCard, barAltura);
+      ctx.restore();
+
+      ctx.font = "800 15px 'Nunito', sans-serif";
+      ctx.fillStyle = d.esMartes ? C.white : C.ink;
+      const etiqueta = d.esMartes ? "MARTES DE TACOS 🌮" : d.label.toUpperCase();
+      ctx.fillText(etiqueta, xCard + padCard, y + barAltura / 2 + 5);
+
+      let yCampo = y + barAltura + gapBarCampo;
+      dibujarCampoEtiquetado(xCard + padCard, yCampo, anchoDentroCard, "Platillo", d.campoPlatillo);
+      yCampo += d.campoPlatillo.alto + gapEntreCampos;
+
+      dibujarCampoEtiquetado(xCard + padCard, yCampo, anchoMitad, "Postre", d.campoPostre);
+      dibujarCampoEtiquetado(xCard + padCard + anchoMitad + 16, yCampo, anchoMitad, "Bebida", d.campoBebida);
+
+      y += d.altoCard + gapEntreCards;
+    });
+
+    // ── Pie: píldora "¡Gracias por su preferencia!" ──
+    ctx.font = "700 24px 'Pacifico', cursive";
+    const wFooterPill = ctx.measureText("¡Gracias por su preferencia!").width + 64;
+    const xFooterPill = (ancho - wFooterPill) / 2;
+    const yFooterPill = y + 12;
+    cajaRedonda(xFooterPill, yFooterPill, wFooterPill, 54, 22);
+    ctx.fillStyle = C.pinkSoft;
+    ctx.fill();
+    ctx.textAlign = "center";
+    ctx.fillStyle = C.ink;
+    ctx.fillText("¡Gracias por su preferencia!", ancho / 2, yFooterPill + 35);
+    ctx.textAlign = "left";
+
+    const enlace = document.createElement("a");
+    enlace.download = `Menu-DeliLunch-${menu.semana.replace(/\s+/g, "-")}.png`;
+    enlace.href = canvas.toDataURL("image/png");
+    enlace.click();
+  };
+
+  // ── Acciones ──
+  const guardarPedido = () => {
+    if (!form.nombre.trim()) { setAviso("Falta el nombre del cliente"); setTimeout(() => setAviso(""), 2500); return; }
+    const tieneDia = DIAS.some(({ key }) => form.dias[key]);
+    const tieneExtra = Object.values(form.extras || {}).some((v) => (v || 0) > 0);
+    if (!tieneDia && !tieneExtra) { setAviso("Elige al menos un día o un producto"); setTimeout(() => setAviso(""), 2500); return; }
+    const lista = editando
+      ? pedidos.map((p) => (p.id === editando ? { ...form } : p))
+      : [...pedidos, { ...form }];
+    guardar(null, lista);
+    setForm(pedidoVacio());
+    setEditando(null);
+    setMostrarFormPedido(false);
+    setVista("pedidos");
+  };
+  const borrarPedido = (id) => guardar(null, pedidos.filter((p) => p.id !== id));
+  const togglePagado = (id) => guardar(null, pedidos.map((p) => (p.id === id ? { ...p, pagado: !p.pagado } : p)));
+  const toggleEntregado = (id, d) =>
+    guardar(null, pedidos.map((p) => (p.id === id ? { ...p, entregado: { ...p.entregado, [d]: !p.entregado?.[d] } } : p)));
+  const editarPedido = (p) => { setForm({ ...p }); setEditando(p.id); setMostrarFormPedido(true); setVista("pedidos"); window.scrollTo({ top: 0, behavior: "smooth" }); };
+  const nuevaSemana = () => {
+    // Si el menú festivo tiene fecha posterior a hoy, sus pedidos NO se archivan con esta semana:
+    // pasan a la semana nueva, que es donde se entrega (y donde debe sumar su ingreso).
+    const festivoPasa = !!menuFestivo.fecha && menuFestivo.fecha > hoyISO() && festivoPedidos.length > 0;
+    const festivoArchivar = festivoPasa ? [] : festivoPedidos;
+    const festivoSigue = festivoPasa ? festivoPedidos : [];
+    if (!pedidos.length && !clubPedidos.length && !festivoArchivar.length) {
+      guardar(null, [], null, [], undefined, null, festivoSigue);
+      return;
+    }
+    const avisoFestivo = festivoPasa
+      ? `\n\n🎉 Los ${festivoPedidos.length} pedido(s) de "${menuFestivo.nombre}" (${formatoFechaCorta(menuFestivo.fecha)}) pasan a la semana nueva, porque se entregan después de hoy.`
+      : "";
+    if (!confirm("Esto archiva la semana actual en 'Semanas' (podrás consultarla y marcar pagos pendientes) y empieza una nueva con pedidos vacíos. Los menús y precios se conservan." + avisoFestivo + "\n\n¿Continuar?")) return;
+    const archivo = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      semana: menu.semana,
+      cerrada: new Date().toISOString(),
+      menu: JSON.parse(JSON.stringify(menu)),
+      pedidos: JSON.parse(JSON.stringify(pedidos)),
+      clubPrecios: JSON.parse(JSON.stringify(clubPrecios)),
+      clubPedidos: JSON.parse(JSON.stringify(clubPedidos)),
+      menuFestivo: JSON.parse(JSON.stringify(menuFestivo)),
+      festivoPedidos: JSON.parse(JSON.stringify(festivoArchivar)),
+      folios: JSON.parse(JSON.stringify(folios.asignados || {})),
+    };
+    // El consecutivo de folios continúa; solo se limpian los asignados de la semana
+    guardar(null, [], null, [], [archivo, ...historial], null, festivoSigue, { siguiente: folios.siguiente || 1, asignados: {} });
+  };
+
+  // ── Acciones sobre semanas archivadas ──
+  const toggleHistPagado = (weekId, pedidoId) =>
+    guardar(null, null, null, null, historial.map((h) =>
+      h.id === weekId ? { ...h, pedidos: h.pedidos.map((p) => (p.id === pedidoId ? { ...p, pagado: !p.pagado } : p)) } : h
+    ));
+  const toggleHistPagadoClub = (weekId, pedidoId) =>
+    guardar(null, null, null, null, historial.map((h) =>
+      h.id === weekId ? { ...h, clubPedidos: h.clubPedidos.map((p) => (p.id === pedidoId ? { ...p, pagado: !p.pagado } : p)) } : h
+    ));
+  const borrarHistPedido = (weekId, pedidoId) =>
+    guardar(null, null, null, null, historial.map((h) =>
+      h.id === weekId ? { ...h, pedidos: h.pedidos.filter((p) => p.id !== pedidoId) } : h
+    ));
+  const borrarHistClubPedido = (weekId, pedidoId) =>
+    guardar(null, null, null, null, historial.map((h) =>
+      h.id === weekId ? { ...h, clubPedidos: h.clubPedidos.filter((p) => p.id !== pedidoId) } : h
+    ));
+  const toggleHistPagadoFestivo = (weekId, pedidoId) =>
+    guardar(null, null, null, null, historial.map((h) =>
+      h.id === weekId ? { ...h, festivoPedidos: (h.festivoPedidos || []).map((p) => (p.id === pedidoId ? { ...p, pagado: !p.pagado } : p)) } : h
+    ));
+  const borrarHistFestivoPedido = (weekId, pedidoId) =>
+    guardar(null, null, null, null, historial.map((h) =>
+      h.id === weekId ? { ...h, festivoPedidos: (h.festivoPedidos || []).filter((p) => p.id !== pedidoId) } : h
+    ));
+  // Cambia el nombre de una semana archivada (también el que sale en sus PDF)
+  const renombrarSemanaHistorial = (weekId, nuevoNombre) => {
+    const nombre = (nuevoNombre || "").trim();
+    if (!nombre) { setAviso("Escribe un nombre para la semana"); setTimeout(() => setAviso(""), 2500); return; }
+    guardar(null, null, null, null, historial.map((h) =>
+      h.id === weekId ? { ...h, semana: nombre, menu: { ...h.menu, semana: nombre } } : h
+    ));
+    setTituloHist(null);
+  };
+  const moverFestivoHistorial = (desdeId, haciaId) => {
+    const origen = historial.find((h) => h.id === desdeId);
+    if (!origen || !(origen.festivoPedidos || []).length) return;
+    const nombreDestino = haciaId === "actual" ? `la semana actual (${menu.semana})` : historial.find((h) => h.id === haciaId)?.semana;
+    if (!confirm(`¿Mover los ${origen.festivoPedidos.length} pedido(s) festivos de "${origen.semana}" a ${nombreDestino}? Su ingreso se sumará a esa semana.`)) return;
+    const pedidosMover = origen.festivoPedidos;
+    const menuMover = origen.menuFestivo || MENU_FESTIVO_INICIAL;
+    let nuevoHistorial = historial.map((h) => (h.id === desdeId ? { ...h, festivoPedidos: [] } : h));
+    if (haciaId === "actual") {
+      guardar(null, null, null, null, nuevoHistorial, { ...MENU_FESTIVO_INICIAL, ...menuMover }, [...festivoPedidos, ...pedidosMover]);
+    } else {
+      nuevoHistorial = nuevoHistorial.map((h) => (h.id === haciaId
+        ? { ...h, menuFestivo: menuMover, festivoPedidos: [...(h.festivoPedidos || []), ...pedidosMover] } : h));
+      guardar(null, null, null, null, nuevoHistorial);
+    }
+    setAviso("Pedidos festivos movidos ✓");
+    setTimeout(() => setAviso(""), 2000);
+  };
+  const borrarSemanaHistorial = (weekId) => {
+    if (!confirm("¿Borrar permanentemente esta semana del historial? Esta acción no se puede deshacer.")) return;
+    guardar(null, null, null, null, historial.filter((h) => h.id !== weekId));
+    setSemanaAbierta(null);
+  };
+
+  // ── Acciones Club de Tareas ──
+  const guardarClubPedido = () => {
+    if (!clubForm.nombre.trim()) { setAviso("Falta el nombre del cliente"); setTimeout(() => setAviso(""), 2500); return; }
+    const hayItems = CLUB_ITEMS.some((it) => (clubForm.items?.[it.key] || 0) > 0);
+    if (!hayItems) { setAviso("Elige al menos un artículo"); setTimeout(() => setAviso(""), 2500); return; }
+    const lista = clubEditando
+      ? clubPedidos.map((p) => (p.id === clubEditando ? { ...clubForm } : p))
+      : [...clubPedidos, { ...clubForm }];
+    guardar(null, null, null, lista);
+    setClubForm(clubPedidoVacio());
+    setClubEditando(null);
+  };
+  const borrarClubPedido = (id) => guardar(null, null, null, clubPedidos.filter((p) => p.id !== id));
+  const togglePagadoClub = (id) => guardar(null, null, null, clubPedidos.map((p) => (p.id === id ? { ...p, pagado: !p.pagado } : p)));
+  const editarClubPedido = (p) => {
+    setClubForm({ ...p, items: { ...p.items } });
+    setClubEditando(p.id);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  // ── Acciones Menú festivo ──
+  const guardarMenuFestivo = () => guardar(null, null, null, null, null, menuFestivo);
+  const guardarFestivoPedido = () => {
+    if (!festivoForm.nombre.trim()) { setAviso("Falta el nombre del cliente"); setTimeout(() => setAviso(""), 2500); return; }
+    const hayPlatillos = Object.values(festivoForm.platillos || {}).some((v) => (v || 0) > 0);
+    if (!hayPlatillos) { setAviso("Elige al menos un platillo"); setTimeout(() => setAviso(""), 2500); return; }
+    const lista = festivoEditando
+      ? festivoPedidos.map((p) => (p.id === festivoEditando ? { ...festivoForm } : p))
+      : [...festivoPedidos, { ...festivoForm }];
+    guardar(null, null, null, null, null, null, lista);
+    setFestivoForm(festivoPedidoVacio());
+    setFestivoEditando(null);
+  };
+  const borrarFestivoPedido = (id) => guardar(null, null, null, null, null, null, festivoPedidos.filter((p) => p.id !== id));
+  const togglePagadoFestivo = (id) =>
+    guardar(null, null, null, null, null, null, festivoPedidos.map((p) => (p.id === id ? { ...p, pagado: !p.pagado } : p)));
+  const editarFestivoPedido = (p) => {
+    setFestivoForm({ ...festivoPedidoVacio(), ...p, platillos: { ...(p.platillos || {}) } });
+    setFestivoEditando(p.id);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  // ── UI helpers ──
+  const chip = (activo, colorOn = C.plum) => ({
+    padding: "7px 12px", borderRadius: 999, fontSize: 13, fontWeight: 700, cursor: "pointer",
+    border: `2px solid ${activo ? colorOn : "#E4D8E9"}`,
+    background: activo ? colorOn : C.white, color: activo ? C.white : C.ink,
+    transition: "all .15s",
+  });
+  const inputS = {
+    width: "100%", padding: "10px 12px", borderRadius: 12, border: "2px solid #E9DCEF",
+    background: C.white, fontSize: 15, color: C.ink, outline: "none", boxSizing: "border-box",
+  };
+  const tarjeta = { background: C.white, borderRadius: 18, padding: 16, boxShadow: "0 2px 10px rgba(139,30,91,.07)" };
+  const etiquetaDia = (d) => ({
+    display: "inline-block", padding: "3px 12px", borderRadius: 6, fontSize: 12, fontWeight: 800,
+    letterSpacing: 1, textTransform: "uppercase",
+    background: d === "mar" ? C.mustard : C.pink, color: d === "mar" ? C.white : C.ink,
+  });
+
+  if (cargando)
+    return (
+      <div style={{ minHeight: "100vh", background: C.cream, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "Nunito, system-ui, sans-serif", color: C.plum, fontWeight: 700 }}>
+        Calentando el comal…
+      </div>
+    );
+
+  const gradosPedidos = ordenarGrados(Array.from(new Set(pedidos.map((p) => (p.grado || "").trim()).filter(Boolean))));
+  const ordenarPorGradoYNombre = (lista) => [...lista].sort((a, b) =>
+    compararGrado(a.grado, b.grado) || (a.nombre || "").localeCompare(b.nombre || "", "es", { sensitivity: "base" }));
+  const filtrados = ordenarPorGradoYNombre(pedidos
+    .filter((p) => (filtroDia === "todos" ? true : p.dias[filtroDia]))
+    .filter((p) => (filtroGrado === "todos" ? true : (p.grado || "").trim() === filtroGrado)));
+  const clubOrdenados = ordenarPorGradoYNombre(clubPedidos);
+  // Encabezado de grupo por grado: aparece cuando cambia el grado en una lista ya ordenada
+  const encabezadoGrado = (lista, idx, totalDe) => {
+    const p = lista[idx];
+    if (idx > 0 && compararGrado(lista[idx - 1].grado, p.grado) === 0) return null;
+    const delGrado = lista.filter((x) => compararGrado(x.grado, p.grado) === 0);
+    const total = delGrado.reduce((a, x) => a + totalDe(x), 0);
+    const pendiente = delGrado.filter((x) => !x.pagado).reduce((a, x) => a + totalDe(x), 0);
+    const porPagar = delGrado.filter((x) => !x.pagado).length;
+    return (
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "8px 12px", borderRadius: 12, background: C.lavSoft, marginTop: idx === 0 ? 0 : 6 }}>
+        <span style={{ fontWeight: 900, color: C.plum }}>🎓 {(p.grado || "").trim() || "Sin grado"} · {delGrado.length} pedido{delGrado.length === 1 ? "" : "s"}</span>
+        <span style={{ fontSize: 12, fontWeight: 800 }}>
+          <span style={{ color: "#7A6884" }}>Total ${total}</span>
+          {"  ·  "}
+          {pendiente > 0
+            ? <span style={{ color: "#B0486B" }}>⏳ Pendiente ${pendiente} ({porPagar})</span>
+            : <span style={{ color: C.ok }}>✓ Todo pagado</span>}
+        </span>
+      </div>
+    );
+  };
+
+  const gradosFestivo = ordenarGrados(Array.from(new Set(festivoPedidos.map((p) => (p.grado || "").trim()).filter(Boolean))));
+  const festivoFiltrados = festivoPedidos
+    .filter((p) => (filtroGradoFestivo === "todos" ? true : (p.grado || "").trim() === filtroGradoFestivo));
+  const festivoCantidadesFiltradas = festivoNombresPlatillos.reduce((acc, nombrePl) => {
+    acc[nombrePl] = festivoFiltrados.reduce((a, p) => a + (p.platillos?.[nombrePl] || 0), 0);
+    return acc;
+  }, {});
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.cream, fontFamily: "Nunito, 'Segoe UI', system-ui, sans-serif", color: C.ink, paddingBottom: 90 }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Pacifico&family=Nunito:wght@400;700;800;900&display=swap');
+        button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid ${C.lavender}; outline-offset: 2px; }
+        input::placeholder { color: #B9A6C2; }
+      `}</style>
+
+      {/* ── Encabezado ── */}
+      <header style={{ background: `linear-gradient(120deg, ${C.pinkSoft}, ${C.lavSoft})`, padding: "22px 18px 16px", borderBottom: `4px solid ${C.lavender}` }}>
+        <div style={{ maxWidth: 680, margin: "0 auto", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+          <div>
+            <div style={{ fontFamily: "'Pacifico', cursive", fontSize: 30, color: C.plum, lineHeight: 1.1 }}>Deli-Lunch</div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#7A5E86" }}>
+              {menu.semana} · {pedidos.length} pedido{pedidos.length !== 1 ? "s" : ""}
+              <span style={{ marginLeft: 8, color: conectado ? C.ok : "#B0486B" }}>
+                {conectado ? "● en línea" : "● sin conexión"}
+              </span>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            <button onClick={() => descargarPDF()} style={{ ...chip(false), background: C.white, borderColor: C.teal, color: "#3E7A6C" }}>
+              📄 PDF semana
+            </button>
+            <button onClick={descargarMenuPNG} style={{ ...chip(false), background: C.white, borderColor: C.mustard, color: "#9C6B14" }}>
+              🖼️ Menú PNG
+            </button>
+            <button onClick={nuevaSemana} style={{ ...chip(false), background: C.white, borderColor: C.lavender, color: C.plum }}>
+              Nueva semana
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {aviso && (
+        <div style={{ position: "fixed", top: 12, left: "50%", transform: "translateX(-50%)", background: C.plum, color: C.white, padding: "8px 18px", borderRadius: 999, fontSize: 13, fontWeight: 700, zIndex: 50, boxShadow: "0 4px 14px rgba(0,0,0,.2)" }}>
+          {aviso}
+        </div>
+      )}
+
+      <main style={{ maxWidth: 680, margin: "0 auto", padding: "18px 14px" }}>
+
+        {/* ══ RESUMEN ══ */}
+        {vista === "resumen" && (
+          <div style={{ display: "grid", gap: 14 }}>
+            <h2 style={{ margin: "2px 0 0", fontSize: 17, fontWeight: 900, color: C.plum }}>¿Cuánto cocino? 🍳</h2>
+            {DIAS.map(({ key, label }) => {
+              const r = resumenDia(key);
+              return (
+                <div key={key} style={tarjeta}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                    <span style={etiquetaDia(key)}>{key === "mar" ? "Martes de tacos" : label}</span>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontWeight: 900, color: C.plum }}>${r.ingreso}</span>
+                      <button onClick={() => copiarDia(key)} title="Copiar resumen para WhatsApp"
+                        style={{ ...chip(false), padding: "5px 10px", fontSize: 12, borderColor: C.teal, color: "#3E7A6C", background: "#EFF7F4" }}>
+                        📋 Copiar
+                      </button>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 13, color: "#7A6884", marginBottom: 10 }}>{menu.platillos[key].plato}</div>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <Dato n={r.desayunos} t="desayunos" c={C.pink} />
+                    <Dato n={r.postres} t="postres" c={C.lavender} />
+                    <Dato n={r.aguas} t="aguas" c={C.teal} />
+                  </div>
+                </div>
+              );
+            })}
+
+            <div style={{ ...tarjeta, background: C.plum, color: C.white }}>
+              <div style={{ fontSize: 13, fontWeight: 700, opacity: 0.85, marginBottom: 6 }}>La semana en números</div>
+              <div style={{ fontSize: 28, fontWeight: 900 }}>${ingresoSemana} <span style={{ fontSize: 14, fontWeight: 700, opacity: 0.8 }}>esperados</span></div>
+              <div style={{ display: "flex", gap: 14, marginTop: 10, fontSize: 13, fontWeight: 700, flexWrap: "wrap" }}>
+                <span>💵 Efectivo: ${porPago["Efectivo"] || 0}</span>
+                <span>🏦 Transferencia: ${porPago["Transferencia"] || 0}</span>
+                <span>💳 Tap to Pay: ${porPago["Tap to Pay"] || 0}</span>
+                <span style={{ color: C.pink }}>⏳ Por cobrar: ${pendienteCobro}</span>
+              </div>
+              {comisionSemana > 0 && (
+                <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85 }}>
+                  Incluye ${comisionSemana} de comisión Tap to Pay ({comisionPct}%) cobrada al cliente
+                </div>
+              )}
+              {(extrasTot.botellas > 0 || extrasTot.litros > 0 || extrasTot.postres > 0 || extrasTot.lechitas > 0 || extrasTot.jugos > 0 || extrasTot.variosMonto > 0) && (
+                <div style={{ marginTop: 8, fontSize: 13, opacity: 0.9 }}>
+                  Extras: {extrasTot.botellas} agua embotellada · {extrasTot.litros} agua 1L · {extrasTot.postres} solo postre · {extrasTot.lechitas} lechita · {extrasTot.jugos} jugo 500 ml
+                  {extrasTot.variosMonto > 0 ? ` · Varios: $${extrasTot.variosMonto}` : ""}
+                </div>
+              )}
+            </div>
+
+            <h2 style={{ margin: "6px 0 0", fontSize: 17, fontWeight: 900, color: C.plum }}>🎒 Club de Tareas</h2>
+            {clubPedidos.length === 0 ? (
+              <div style={{ ...tarjeta, textAlign: "center", color: "#8A7794", padding: 24 }}>
+                Aún no hay pedidos del Club de Tareas. Ve a la pestaña <b>Club</b> para capturarlos.
+              </div>
+            ) : (
+              <div style={{ ...tarjeta, display: "grid", gap: 8 }}>
+                {CLUB_ITEMS.filter((it) => clubCantidades[it.key] > 0).map((it) => (
+                  <div key={it.key} style={{ display: "flex", justifyContent: "space-between", fontSize: 14 }}>
+                    <span>{it.label}</span>
+                    <span style={{ fontWeight: 800, color: C.plum }}>{clubCantidades[it.key]}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ ...tarjeta, background: C.mustard, color: C.white }}>
+              <div style={{ fontSize: 13, fontWeight: 700, opacity: 0.9, marginBottom: 6 }}>Club de Tareas · ingreso</div>
+              <div style={{ fontSize: 24, fontWeight: 900 }}>${clubIngreso}</div>
+              <div style={{ display: "flex", gap: 14, marginTop: 8, fontSize: 13, fontWeight: 700, flexWrap: "wrap" }}>
+                <span>💵 Efectivo: ${clubPorPago["Efectivo"] || 0}</span>
+                <span>🏦 Transferencia: ${clubPorPago["Transferencia"] || 0}</span>
+                <span>💳 Tap to Pay: ${clubPorPago["Tap to Pay"] || 0}</span>
+                <span>⏳ Por cobrar: ${clubPendiente}</span>
+              </div>
+              {comisionClub > 0 && (
+                <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85 }}>
+                  Incluye ${comisionClub} de comisión Tap to Pay ({comisionPct}%) cobrada al cliente
+                </div>
+              )}
+            </div>
+
+            {festivoPedidos.length > 0 && (
+              <div style={{ ...tarjeta, background: C.lavender, color: C.white }}>
+                <div style={{ fontSize: 13, fontWeight: 700, opacity: 0.9, marginBottom: 6 }}>
+                  🎉 {menuFestivo.nombre || "Menú festivo"}{menuFestivo.fecha ? ` (${formatoFechaCorta(menuFestivo.fecha)})` : ""} · ingreso
+                </div>
+                <div style={{ fontSize: 24, fontWeight: 900 }}>${festivoIngreso}</div>
+                <div style={{ display: "flex", gap: 14, marginTop: 8, fontSize: 13, fontWeight: 700, flexWrap: "wrap" }}>
+                  <span>💵 Efectivo: ${festivoPorPago["Efectivo"] || 0}</span>
+                  <span>🏦 Transferencia: ${festivoPorPago["Transferencia"] || 0}</span>
+                  <span>💳 Tap to Pay: ${festivoPorPago["Tap to Pay"] || 0}</span>
+                  <span>⏳ Por cobrar: ${festivoPendiente}</span>
+                </div>
+                {comisionFestivo > 0 && (
+                  <div style={{ marginTop: 6, fontSize: 12, opacity: 0.85 }}>
+                    Incluye ${comisionFestivo} de comisión Tap to Pay ({comisionPct}%) cobrada al cliente
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div style={{ ...tarjeta, textAlign: "center", color: "#8A7794" }}>
+              ¿Quieres ver el total de la semana por grupo, lo recaudado y lo pendiente por cobrar?
+              Ve a la pestaña <b>General</b> 📊.
+            </div>
+          </div>
+        )}
+
+        {/* ══ RESUMEN GENERAL (independiente, por grupo) ══ */}
+        {vista === "general" && (
+          <div style={{ display: "grid", gap: 14 }}>
+            <h2 style={{ margin: "2px 0 0", fontSize: 17, fontWeight: 900, color: C.plum }}>Resumen general 📊</h2>
+
+            <div style={{ ...tarjeta, background: C.plum, color: C.white }}>
+              <div style={{ fontSize: 13, fontWeight: 700, opacity: 0.85 }}>Total general de la semana</div>
+              <div style={{ fontSize: 26, fontWeight: 900 }}>${ingresoSemana + clubIngreso + festivoIngreso}</div>
+              <div style={{ display: "flex", gap: 14, marginTop: 10, fontSize: 13, fontWeight: 700, flexWrap: "wrap" }}>
+                <span>✅ Recaudado: ${recaudadoSemana + clubRecaudado + festivoRecaudado}</span>
+                <span style={{ color: C.pink }}>⏳ Pendiente por cobrar: ${pendienteCobro + clubPendiente + festivoPendiente}</span>
+              </div>
+              {festivoPedidos.length > 0 && (
+                <div style={{ marginTop: 6, fontSize: 12, opacity: 0.9 }}>
+                  Incluye 🎉 {menuFestivo.nombre || "Menú festivo"}: ${festivoIngreso}{festivoPendiente > 0 ? ` (por cobrar $${festivoPendiente})` : " (todo cobrado)"}
+                </div>
+              )}
+            </div>
+
+            {(() => {
+              const gradosGeneral = gradosOrdenados.filter((g) => porGrado[g].pedidos > 0 || porGrado[g].clubPedidos > 0 || porGrado[g].festivoPedidos > 0);
+              return gradosGeneral.length === 0 ? (
+                <div style={{ ...tarjeta, textAlign: "center", color: "#8A7794", padding: 24 }}>
+                  Aún no hay pedidos con grupo/grado asignado. Captura el grado al crear un pedido (desayuno o Club) para verlo aquí.
+                </div>
+              ) : (
+                <>
+                  <h2 style={{ margin: "6px 0 0", fontSize: 17, fontWeight: 900, color: C.plum }}>Pedidos por grupo</h2>
+                  {gradosGeneral.map((gradoTxt) => {
+                  const pg = porGrado[gradoTxt];
+                  return (
+                    <div key={gradoTxt} style={tarjeta}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                        <span style={{ ...etiquetaDia("otro"), background: C.lavender, color: C.white }}>{gradoTxt}</span>
+                        <span style={{ fontWeight: 900, color: C.plum }}>${pg.ingreso + pg.clubIngreso + pg.festivoIngreso}</span>
+                      </div>
+                      <div style={{ display: "flex", gap: 14, marginBottom: 8, fontSize: 12, fontWeight: 800, flexWrap: "wrap" }}>
+                        <span style={{ color: C.ok }}>✅ Recaudado: ${pg.recaudado}</span>
+                        <span style={{ color: "#B0486B" }}>⏳ Por cobrar: ${pg.pendiente}</span>
+                      </div>
+                      {pg.desayunos > 0 && (
+                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+                          {DIAS.filter(({ key }) => pg.porDia[key].desayunos > 0).map(({ key, label }) => (
+                            <Dato key={key} n={pg.porDia[key].desayunos} t={label.slice(0, 3)} c={C.pink} />
+                          ))}
+                        </div>
+                      )}
+                      {pg.festivoPedidos > 0 && (
+                        <div style={{ fontSize: 12, color: "#7A6884", marginBottom: 4 }}>
+                          🎉 {festivoNombresPlatillos.filter((n) => pg.festivoCantidades?.[n] > 0)
+                            .map((n) => `${pg.festivoCantidades[n]} ${n}`).join(" · ") || `${pg.festivoCantidad} menú(s)`} · ${pg.festivoIngreso}
+                        </div>
+                      )}
+                      {pg.clubPedidos > 0 && (
+                        <div style={{ fontSize: 12, color: "#7A6884", marginBottom: 4 }}>
+                          🎒 {CLUB_ITEMS.filter((it) => pg.clubCantidades[it.key] > 0)
+                            .map((it) => `${pg.clubCantidades[it.key]} ${it.label}`)
+                            .join(" · ")}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                </>
+              );
+            })()}
+
+            {(() => {
+              const clientesConDeuda = clientesOrdenados.filter((clave) => porCliente[clave].pendiente > 0);
+              return clientesConDeuda.length === 0 ? null : (
+                <>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap", margin: "6px 0 0" }}>
+                    <h2 style={{ margin: 0, fontSize: 17, fontWeight: 900, color: C.plum }}>Total por cliente 🧾</h2>
+                    <button onClick={() => {
+                      const asignados = asegurarFolios(clientesConDeuda);
+                      clientesConDeuda.forEach((clave, i) => setTimeout(() => descargarNotaCliente(clave, asignados[clave]), i * 350));
+                    }}
+                      style={{ ...chip(false), borderColor: C.plum, color: C.plum }}>
+                      📄 Descargar notas de todos
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 12, color: "#8A7794", margin: "-4px 0 2px" }}>
+                    Junta lo de Pedidos, Club de Tareas y Menú festivo cuando coinciden <b>nombre y grado</b>, ordenado por grado. Cada nota lleva un folio consecutivo que se conserva aunque la vuelvas a descargar.
+                  </div>
+                  {clientesConDeuda.map((clave, idx) => {
+                    const c = porCliente[clave];
+                    const gradoAnterior = idx > 0 ? porCliente[clientesConDeuda[idx - 1]].grado : null;
+                    const nuevoGrupo = idx === 0 || compararGrado(gradoAnterior, c.grado) !== 0;
+                    const delGrado = clientesConDeuda.filter((k) => compararGrado(porCliente[k].grado, c.grado) === 0);
+                    const debeGrado = delGrado.reduce((a, k) => a + porCliente[k].pendiente, 0);
+                    const folioAsignado = folios.asignados?.[clave];
+                    return (
+                      <React.Fragment key={clave}>
+                      {nuevoGrupo && (
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", borderRadius: 12, background: C.lavSoft, marginTop: idx === 0 ? 0 : 6 }}>
+                          <span style={{ fontWeight: 900, color: C.plum }}>🎓 {c.grado || "Sin grado"} · {delGrado.length} cliente{delGrado.length === 1 ? "" : "s"}</span>
+                          <span style={{ fontWeight: 900, color: "#B0486B", fontSize: 13 }}>Debe ${debeGrado}</span>
+                        </div>
+                      )}
+                      <div style={tarjeta}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                            <span style={{ fontWeight: 900, color: C.plum }}>{c.nombre}</span>
+                            {c.grado && (
+                              <span style={{ ...etiquetaDia("otro"), background: C.lavender, color: C.white, fontSize: 11 }}>{c.grado}</span>
+                            )}
+                            {c.coincide && (
+                              <span style={{ ...etiquetaDia("otro"), background: C.pink, color: C.white, fontSize: 11 }}>
+                                🔗 {[c.tienePedidos && "Pedidos", c.tieneClub && "Club", c.tieneFestivo && "Festivo"].filter(Boolean).join(" + ")}
+                              </span>
+                            )}
+                            {folioAsignado && (
+                              <span style={{ fontSize: 11, fontWeight: 800, color: "#8A7794" }}>Folio {formatoFolio(folioAsignado)}</span>
+                            )}
+                          </div>
+                          <span style={{ fontWeight: 900, color: C.plum, fontSize: 15 }}>${c.total}</span>
+                        </div>
+                        <div style={{ display: "flex", gap: 14, marginTop: 8, fontSize: 12, fontWeight: 800, flexWrap: "wrap" }}>
+                          {c.tienePedidos && <span style={{ color: "#7A6884" }}>📋 Pedidos: ${c.totalPedidos}</span>}
+                          {c.tieneClub && <span style={{ color: "#7A6884" }}>🎒 Club: ${c.totalClub}</span>}
+                          {c.tieneFestivo && <span style={{ color: "#7A6884" }}>🎉 Festivo: ${c.totalFestivo}{c.pendienteFestivo > 0 ? ` (debe $${c.pendienteFestivo})` : " ✓"}</span>}
+                          <span style={{ color: C.ok }}>✅ Recaudado: ${c.recaudado}</span>
+                          <span style={{ color: "#B0486B" }}>⏳ Debe: ${c.pendiente}</span>
+                        </div>
+                        <button onClick={() => descargarNotaCliente(clave)}
+                          style={{ marginTop: 10, padding: "8px 12px", borderRadius: 10, border: "none", background: C.plum, color: C.white, fontSize: 12, fontWeight: 800, cursor: "pointer" }}>
+                          📄 Descargar nota para enviar
+                        </button>
+                      </div>
+                      </React.Fragment>
+                    );
+                  })}
+                </>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* ══ PEDIDOS (incluye el formulario para agregar/editar) ══ */}
+        {vista === "pedidos" && (
+          <div style={{ display: "grid", gap: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <h2 style={{ margin: 0, fontSize: 17, fontWeight: 900, color: C.plum }}>
+                {mostrarFormPedido || editando ? (editando ? "Editar pedido ✏️" : "Nuevo pedido 📝") : "Pedidos 📋"}
+              </h2>
+              {!(mostrarFormPedido || editando) && (
+                <button onClick={() => { setForm(pedidoVacio()); setEditando(null); setMostrarFormPedido(true); }}
+                  style={{ ...chip(false), background: C.plum, borderColor: C.plum, color: C.white }}>
+                  ➕ Nuevo pedido
+                </button>
+              )}
+            </div>
+
+            {(mostrarFormPedido || editando) && (
+              <div style={{ display: "grid", gap: 14 }}>
+                <div style={{ ...tarjeta, display: "grid", gap: 10 }}>
+                  <input style={inputS} placeholder="Nombre del cliente" value={form.nombre}
+                    onChange={(e) => setForm({ ...form, nombre: e.target.value })} />
+                  <input style={inputS} placeholder="Grado (opcional, ej. 3°A)" value={form.grado}
+                    onChange={(e) => setForm({ ...form, grado: e.target.value })} />
+                  <input style={inputS} placeholder="Teléfono / WhatsApp (opcional)" value={form.telefono}
+                    onChange={(e) => setForm({ ...form, telefono: e.target.value })} />
+                  <label style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>
+                    Cantidad por día
+                    <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                      {[1, 2, 3, 4, 5].map((n) => (
+                        <button key={n} style={chip(form.qty === n)} onClick={() => setForm({ ...form, qty: n })}>{n}</button>
+                      ))}
+                    </div>
+                  </label>
+                </div>
+
+                <div style={{ ...tarjeta, display: "grid", gap: 12 }}>
+                  <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Paquete por día · toca para elegir</div>
+                  {DIAS.map(({ key, label }) => (
+                    <div key={key}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                        <span style={etiquetaDia(key)}>{key === "mar" ? "Martes 🌮" : label}</span>
+                        <span style={{ fontSize: 12, color: "#8A7794" }}>{menu.platillos[key].plato}</span>
+                      </div>
+                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                        <button style={chip(!form.dias[key], "#B9A6C2")}
+                          onClick={() => setForm({ ...form, dias: { ...form.dias, [key]: null } })}>—</button>
+                        {PAQUETES.map((pq) => (
+                          <button key={pq.key} style={chip(form.dias[key] === pq.key)}
+                            onClick={() => setForm({ ...form, dias: { ...form.dias, [key]: pq.key } })}>
+                            {pq.label} ${menu.precios[pq.key]}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{ ...tarjeta, display: "grid", gap: 10 }}>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Otros productos</div>
+                    <div style={{ fontSize: 12, color: "#8A7794" }}>No siempre se necesita un desayuno: puedes agregar solo una lechita, un postre, etc.</div>
+                  </div>
+                  <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                    <Contador label={`Agua embotellada 500ml $${menu.precios.aguaBotella}`} value={form.extras.botellas}
+                      onChange={(v) => setForm({ ...form, extras: { ...form.extras, botellas: v } })} />
+                    <Contador label={`Agua 1 litro $${menu.precios.agua1L || 0}`} value={form.extras.litros || 0}
+                      onChange={(v) => setForm({ ...form, extras: { ...form.extras, litros: v } })} />
+                    <Contador label={`Solo postre $${menu.precios.soloPostre}`} value={form.extras.postres}
+                      onChange={(v) => setForm({ ...form, extras: { ...form.extras, postres: v } })} />
+                    <Contador label={`Lechita $${menu.precios.lechita || 0}`} value={form.extras.lechitas || 0}
+                      onChange={(v) => setForm({ ...form, extras: { ...form.extras, lechitas: v } })} />
+                    <Contador label={`Jugo 500 ml $${menu.precios.jugo500 || 0}`} value={form.extras.jugos || 0}
+                      onChange={(v) => setForm({ ...form, extras: { ...form.extras, jugos: v } })} />
+                  </div>
+                  <div style={{ display: "grid", gap: 6 }}>
+                    <span style={{ fontSize: 12, fontWeight: 800, color: C.plum }}>Varios (precio libre)</span>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <input style={{ ...inputS, flex: 2 }} placeholder="Describe qué es (ej. 2 tamales extra)"
+                        value={form.extras.variosDesc || ""}
+                        onChange={(e) => setForm({ ...form, extras: { ...form.extras, variosDesc: e.target.value } })} />
+                      <div style={{ display: "flex", alignItems: "center", flex: 1, gap: 4 }}>
+                        <span style={{ fontWeight: 800, color: C.plum }}>$</span>
+                        <input type="number" min="0" style={inputS} placeholder="0"
+                          value={form.extras.variosMonto || ""}
+                          onChange={(e) => setForm({ ...form, extras: { ...form.extras, variosMonto: Number(e.target.value) || 0 } })} />
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {["Efectivo", "Transferencia", "Tap to Pay"].map((m) => (
+                      <button key={m} style={chip(form.pago === m)} onClick={() => setForm({ ...form, pago: m })}>{m}</button>
+                    ))}
+                  </div>
+                  {form.pago === "Tap to Pay" && (
+                    <div style={{ fontSize: 12, color: "#8A7794" }}>
+                      💳 Con Tap to Pay se le suma {menu.precios.comisionTapToPay || 0}% al total: +${comisionPedidoDe(form)} (comisión bancaria)
+                    </div>
+                  )}
+                  <button onClick={() => setForm({ ...form, anticipado: !form.anticipado })}
+                    style={{ ...chip(form.anticipado, C.ok), justifySelf: "start" }}>
+                    {form.anticipado ? "✓" : ""} 💳 Pago anticipado (−{menu.precios.descuentoAnticipado || 0}%)
+                  </button>
+                  <input style={inputS} placeholder="Notas: sin cebolla, entregar 8:30, dirección…" value={form.notas}
+                    onChange={(e) => setForm({ ...form, notas: e.target.value })} />
+                </div>
+
+                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                  <button onClick={guardarPedido} style={{ flex: 1, padding: "14px", borderRadius: 14, border: "none", background: C.plum, color: C.white, fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
+                    {editando ? "Guardar cambios" : "Agregar pedido"} · ${totalPedido(form)}
+                  </button>
+                  <button onClick={() => { setForm(pedidoVacio()); setEditando(null); setMostrarFormPedido(false); }} style={{ ...chip(false), padding: "13px 16px" }}>
+                    Cancelar
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {!(mostrarFormPedido || editando) && (
+              <>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              <button style={chip(filtroDia === "todos")} onClick={() => setFiltroDia("todos")}>Todos</button>
+              {DIAS.map(({ key, label }) => (
+                <button key={key} style={chip(filtroDia === key)} onClick={() => setFiltroDia(key)}>{label.slice(0, 3)}</button>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              <button style={chip(filtroGrado === "todos", C.lavender)} onClick={() => setFiltroGrado("todos")}>Todos los grados</button>
+              {gradosPedidos.map((g) => (
+                <button key={g} style={chip(filtroGrado === g, C.lavender)} onClick={() => setFiltroGrado(g)}>{g}</button>
+              ))}
+            </div>
+
+            {filtrados.length === 0 && (
+              <div style={{ ...tarjeta, textAlign: "center", color: "#8A7794", padding: 30 }}>
+                Aún no hay pedidos {(filtroDia !== "todos" || filtroGrado !== "todos") ? "con ese filtro" : ""}. Toca <b>➕ Nuevo pedido</b> para capturar el primero.
+              </div>
+            )}
+
+            {filtrados.map((p, idx) => (
+              <React.Fragment key={p.id}>
+              {encabezadoGrado(filtrados, idx, totalPedido)}
+              <div style={{ ...tarjeta, borderLeft: `5px solid ${p.pagado ? C.ok : C.pink}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                  <div>
+                    <div style={{ fontWeight: 900, fontSize: 15 }}>
+                      {p.nombre} {p.qty > 1 ? `· x${p.qty}` : ""}
+                      {p.grado && (
+                        <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 800, color: C.plum, background: C.lavSoft, padding: "2px 8px", borderRadius: 999 }}>
+                          {p.grado}
+                        </span>
+                      )}
+                      {p.anticipado && (
+                        <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 800, color: C.white, background: C.ok, padding: "2px 8px", borderRadius: 999 }}>
+                          💳 −{menu.precios.descuentoAnticipado || 0}%
+                        </span>
+                      )}
+                    </div>
+                    {p.telefono && <div style={{ fontSize: 12, color: "#8A7794" }}>{p.telefono}</div>}
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontWeight: 900, color: C.plum }}>${totalPedido(p)}</div>
+                    <div style={{ fontSize: 12, color: "#8A7794" }}>{p.pago}</div>
+                  </div>
+                </div>
+
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", margin: "10px 0" }}>
+                  {DIAS.map(({ key, label }) =>
+                    p.dias[key] ? (
+                      <button key={key} onClick={() => toggleEntregado(p.id, key)}
+                        title="Toca para marcar entregado"
+                        style={{ ...chip(!!p.entregado?.[key], C.ok), fontSize: 12 }}>
+                        {p.entregado?.[key] ? "✓ " : ""}{label.slice(0, 3)} · {(PAQUETES_TODOS.find((q) => q.key === p.dias[key])?.label || "").replace("Desayuno", "Des.")}
+                      </button>
+                    ) : null
+                  )}
+                </div>
+
+                {(p.notas || p.extras?.botellas > 0 || p.extras?.litros > 0 || p.extras?.postres > 0 || p.extras?.lechitas > 0 || p.extras?.jugos > 0 || p.extras?.variosMonto > 0) && (
+                  <div style={{ fontSize: 12, color: "#7A6884", marginBottom: 10 }}>
+                    {p.extras?.botellas > 0 ? `${p.extras.botellas} agua embotellada · ` : ""}
+                    {p.extras?.litros > 0 ? `${p.extras.litros} agua 1L · ` : ""}
+                    {p.extras?.postres > 0 ? `${p.extras.postres} solo postre · ` : ""}
+                    {p.extras?.lechitas > 0 ? `${p.extras.lechitas} lechita · ` : ""}
+                    {p.extras?.jugos > 0 ? `${p.extras.jugos} jugo 500 ml · ` : ""}
+                    {p.extras?.variosMonto > 0 ? `${p.extras.variosDesc || "Varios"}: $${p.extras.variosMonto} · ` : ""}
+                    {p.notas}
+                  </div>
+                )}
+
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={() => togglePagado(p.id)} style={chip(p.pagado, C.ok)}>
+                    {p.pagado ? "✓ Pagado" : "Marcar pagado"}
+                  </button>
+                  <button onClick={() => editarPedido(p)} style={chip(false)}>Editar</button>
+                  <button onClick={() => borrarPedido(p.id)} style={{ ...chip(false), color: "#B0486B", borderColor: "#EFC5D2" }}>Borrar</button>
+                </div>
+              </div>
+              </React.Fragment>
+            ))}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ══ CLUB DE TAREAS ══ */}
+        {vista === "club" && (
+          <div style={{ display: "grid", gap: 14 }}>
+            <h2 style={{ margin: "2px 0 0", fontSize: 17, fontWeight: 900, color: C.plum }}>
+              {clubEditando ? "Editar pedido Club de Tareas ✏️" : "Club de Tareas 🎒"}
+            </h2>
+
+            <div style={{ ...tarjeta, display: "grid", gap: 10 }}>
+              <input style={inputS} placeholder="Nombre del cliente / alumno" value={clubForm.nombre}
+                onChange={(e) => setClubForm({ ...clubForm, nombre: e.target.value })} />
+              <input style={inputS} placeholder="Grado (opcional, ej. 3°A)" value={clubForm.grado}
+                onChange={(e) => setClubForm({ ...clubForm, grado: e.target.value })} />
+              <div style={{ display: "flex", gap: 6 }}>
+                {["Efectivo", "Transferencia", "Tap to Pay"].map((m) => (
+                  <button key={m} style={chip(clubForm.pago === m)} onClick={() => setClubForm({ ...clubForm, pago: m })}>{m}</button>
+                ))}
+              </div>
+              {clubForm.pago === "Tap to Pay" && (
+                <div style={{ fontSize: 12, color: "#8A7794" }}>
+                  💳 Con Tap to Pay se le suma {menu.precios.comisionTapToPay || 0}% al total: +${comisionClubDe(clubForm)} (comisión bancaria)
+                </div>
+              )}
+            </div>
+
+            <div style={{ ...tarjeta, display: "grid", gap: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Antojitos</div>
+              {CLUB_ARTICULOS.map((it) => (
+                <Contador key={it.key} label={`${it.label} $${clubPrecios[it.key] || 0}`}
+                  value={clubForm.items[it.key] || 0}
+                  onChange={(v) => setClubForm({ ...clubForm, items: { ...clubForm.items, [it.key]: v } })} />
+              ))}
+            </div>
+
+            <div style={{ ...tarjeta, display: "grid", gap: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Bebidas</div>
+              {CLUB_BEBIDAS.map((it) => (
+                <Contador key={it.key} label={`${it.label} $${clubPrecios[it.key] || 0}`}
+                  value={clubForm.items[it.key] || 0}
+                  onChange={(v) => setClubForm({ ...clubForm, items: { ...clubForm.items, [it.key]: v } })} />
+              ))}
+            </div>
+
+            <div style={{ ...tarjeta, display: "grid", gap: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Vaso 8oz</div>
+              {CLUB_VASOS.map((it) => (
+                <Contador key={it.key} label={`${it.label} $${clubPrecios[it.key] || 0}`}
+                  value={clubForm.items[it.key] || 0}
+                  onChange={(v) => setClubForm({ ...clubForm, items: { ...clubForm.items, [it.key]: v } })} />
+              ))}
+            </div>
+
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <button onClick={guardarClubPedido} style={{ flex: 1, padding: "14px", borderRadius: 14, border: "none", background: C.mustard, color: C.white, fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
+                {clubEditando ? "Guardar cambios" : "Agregar pedido"} · ${totalClub(clubForm)}
+              </button>
+              {clubEditando && (
+                <button onClick={() => { setClubForm(clubPedidoVacio()); setClubEditando(null); }} style={{ ...chip(false), padding: "13px 16px" }}>
+                  Cancelar
+                </button>
+              )}
+            </div>
+
+            <div style={{ height: 2, background: C.pinkSoft, margin: "6px 0" }} />
+
+            <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Pedidos capturados ({clubPedidos.length})</div>
+            {clubPedidos.length === 0 && (
+              <div style={{ ...tarjeta, textAlign: "center", color: "#8A7794", padding: 30 }}>
+                Aún no hay pedidos del Club de Tareas.
+              </div>
+            )}
+            {clubOrdenados.map((p, idx) => (
+              <React.Fragment key={p.id}>
+              {encabezadoGrado(clubOrdenados, idx, totalClub)}
+              <div style={{ ...tarjeta, borderLeft: `5px solid ${p.pagado ? C.ok : C.pink}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                  <div style={{ fontWeight: 900, fontSize: 15 }}>
+                    {p.nombre}
+                    {p.grado && (
+                      <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 800, color: C.plum, background: C.lavSoft, padding: "2px 8px", borderRadius: 999 }}>
+                        {p.grado}
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontWeight: 900, color: C.plum }}>${totalClub(p)}</div>
+                    <div style={{ fontSize: 12, color: "#8A7794" }}>{p.pago}</div>
+                  </div>
+                </div>
+                <div style={{ fontSize: 12, color: "#7A6884", margin: "8px 0" }}>
+                  {CLUB_ITEMS.filter((it) => p.items?.[it.key] > 0)
+                    .map((it) => `${p.items[it.key]} ${it.label}`)
+                    .join(" · ")}
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={() => togglePagadoClub(p.id)} style={chip(p.pagado, C.ok)}>
+                    {p.pagado ? "✓ Pagado" : "Marcar pagado"}
+                  </button>
+                  <button onClick={() => editarClubPedido(p)} style={chip(false)}>Editar</button>
+                  <button onClick={() => borrarClubPedido(p.id)} style={{ ...chip(false), color: "#B0486B", borderColor: "#EFC5D2" }}>Borrar</button>
+                </div>
+              </div>
+              </React.Fragment>
+            ))}
+          </div>
+        )}
+
+        {/* ══ MENÚ FESTIVO ══ */}
+        {vista === "festivo" && (
+          <div style={{ display: "grid", gap: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <h2 style={{ margin: "2px 0 0", fontSize: 17, fontWeight: 900, color: C.plum }}>
+                {festivoEditando ? "Editar pedido festivo ✏️" : "Menú festivo 🎉"}
+              </h2>
+              <button onClick={() => descargarPDFFestivo()} style={{ ...chip(false), background: C.white, borderColor: C.lavender, color: C.plum }}>
+                📄 PDF Festivos
+              </button>
+            </div>
+
+            <div style={{ ...tarjeta, display: "grid", gap: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Ocasión y platillos</div>
+              <div style={{ fontSize: 12, color: "#8A7794" }}>Cambia esto para cada ocasión especial (Día del Niño, Navidad, etc.). Normalmente lleva un solo precio por el menú completo.</div>
+              <input style={inputS} placeholder="Nombre de la ocasión (ej. Día del Niño)" value={menuFestivo.nombre}
+                onChange={(e) => setMenuFestivo({ ...menuFestivo, nombre: e.target.value })} />
+              <label style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>
+                Fecha de entrega
+                <input style={inputS} type="date" value={menuFestivo.fecha || ""}
+                  onChange={(e) => setMenuFestivo({ ...menuFestivo, fecha: e.target.value })} />
+              </label>
+              <div style={{ fontSize: 12, color: "#8A7794", marginTop: -4 }}>
+                {menuFestivo.fecha
+                  ? (menuFestivo.fecha > hoyISO()
+                    ? `📅 ${formatoFechaCorta(menuFestivo.fecha)}. Si cierras la semana antes de esa fecha, estos pedidos pasan a la semana nueva y su ingreso se suma ahí.`
+                    : `📅 ${formatoFechaCorta(menuFestivo.fecha)}. Se archivará junto con esta semana.`)
+                  : "Sin fecha: los pedidos se archivan con la semana en que se capturan."}
+              </div>
+              {menuFestivo.platillos.map((pl, i) => (
+                <div key={i} style={{ display: "flex", gap: 6 }}>
+                  <input style={{ ...inputS, flex: 1 }} placeholder={`Platillo ${i + 1}`} value={pl}
+                    onChange={(e) => {
+                      const nuevos = [...menuFestivo.platillos];
+                      nuevos[i] = e.target.value;
+                      setMenuFestivo({ ...menuFestivo, platillos: nuevos });
+                    }} />
+                  <button onClick={() => setMenuFestivo({ ...menuFestivo, platillos: menuFestivo.platillos.filter((_, idx) => idx !== i) })}
+                    style={{ ...chip(false), color: "#B0486B", borderColor: "#EFC5D2", padding: "10px 14px" }}>✕</button>
+                </div>
+              ))}
+              <button onClick={() => setMenuFestivo({ ...menuFestivo, platillos: [...menuFestivo.platillos, ""] })}
+                style={{ ...chip(false), justifySelf: "start" }}>+ Agregar platillo</button>
+              <label style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>
+                Precio del menú completo
+                <input style={inputS} type="number" min="0" value={menuFestivo.precio}
+                  onChange={(e) => setMenuFestivo({ ...menuFestivo, precio: Number(e.target.value) || 0 })} />
+              </label>
+              <button onClick={guardarMenuFestivo} style={{ padding: "12px", borderRadius: 14, border: "none", background: C.plum, color: C.white, fontSize: 14, fontWeight: 900, cursor: "pointer" }}>
+                Guardar menú festivo
+              </button>
+            </div>
+
+            <div style={{ ...tarjeta, display: "grid", gap: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>
+                Nuevo pedido — {menuFestivo.nombre || "Menú festivo"} · ${menuFestivo.precio}
+              </div>
+              <input style={inputS} placeholder="Nombre del cliente / alumno" value={festivoForm.nombre}
+                onChange={(e) => setFestivoForm({ ...festivoForm, nombre: e.target.value })} />
+              <input style={inputS} placeholder="Grado (opcional, ej. 3°A)" value={festivoForm.grado}
+                onChange={(e) => setFestivoForm({ ...festivoForm, grado: e.target.value })} />
+              <div style={{ display: "grid", gap: 8 }}>
+                <span style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>¿Qué platillo(s) lleva?</span>
+                {menuFestivo.platillos.filter((pl) => (pl || "").trim()).length === 0 && (
+                  <div style={{ fontSize: 12, color: "#B0486B" }}>Agrega al menos un platillo arriba, en "Ocasión y platillos".</div>
+                )}
+                {menuFestivo.platillos.filter((pl) => (pl || "").trim()).map((pl) => (
+                  <Contador key={pl} label={pl} value={festivoForm.platillos?.[pl] || 0}
+                    onChange={(v) => setFestivoForm({ ...festivoForm, platillos: { ...festivoForm.platillos, [pl]: v } })} />
+                ))}
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                {["Efectivo", "Transferencia", "Tap to Pay"].map((m) => (
+                  <button key={m} style={chip(festivoForm.pago === m)} onClick={() => setFestivoForm({ ...festivoForm, pago: m })}>{m}</button>
+                ))}
+              </div>
+              {festivoForm.pago === "Tap to Pay" && (
+                <div style={{ fontSize: 12, color: "#8A7794" }}>
+                  💳 Con Tap to Pay se le suma {menu.precios.comisionTapToPay || 0}% al total: +${comisionFestivoDe(festivoForm)} (comisión bancaria)
+                </div>
+              )}
+              <input style={inputS} placeholder="Notas (opcional)" value={festivoForm.notas}
+                onChange={(e) => setFestivoForm({ ...festivoForm, notas: e.target.value })} />
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <button onClick={guardarFestivoPedido} style={{ flex: 1, padding: "14px", borderRadius: 14, border: "none", background: C.mustard, color: C.white, fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
+                  {festivoEditando ? "Guardar cambios" : "Agregar pedido"} · ${totalFestivo(festivoForm)}
+                </button>
+                {festivoEditando && (
+                  <button onClick={() => { setFestivoForm(festivoPedidoVacio()); setFestivoEditando(null); }} style={{ ...chip(false), padding: "13px 16px" }}>
+                    Cancelar
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div style={{ height: 2, background: C.pinkSoft, margin: "6px 0" }} />
+
+            {festivoPedidos.length > 0 && (
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                <button style={chip(filtroGradoFestivo === "todos", C.lavender)} onClick={() => setFiltroGradoFestivo("todos")}>Todos los grados</button>
+                {gradosFestivo.map((g) => (
+                  <button key={g} style={chip(filtroGradoFestivo === g, C.lavender)} onClick={() => setFiltroGradoFestivo(g)}>{g}</button>
+                ))}
+              </div>
+            )}
+
+            {festivoFiltrados.length > 0 && (
+              <div style={{ ...tarjeta, display: "grid", gap: 8 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>
+                  Conteo de platillos pedidos{filtroGradoFestivo !== "todos" ? ` · ${filtroGradoFestivo}` : ""}
+                </div>
+                {festivoNombresPlatillos.filter((n) => festivoCantidadesFiltradas[n] > 0).map((nombrePl) => (
+                  <div key={nombrePl} style={{ display: "flex", justifyContent: "space-between", fontSize: 14 }}>
+                    <span>{nombrePl}</span>
+                    <span style={{ fontWeight: 800, color: C.plum }}>{festivoCantidadesFiltradas[nombrePl]}</span>
+                  </div>
+                ))}
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 900, color: C.plum, borderTop: "1px solid #EADFF2", paddingTop: 6 }}>
+                  <span>Total menús</span>
+                  <span>{festivoFiltrados.reduce((a, p) => a + festivoCantidadTotal(p), 0)}</span>
+                </div>
+              </div>
+            )}
+
+            <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Pedidos festivos capturados ({festivoFiltrados.length})</div>
+            {festivoFiltrados.length === 0 && (
+              <div style={{ ...tarjeta, textAlign: "center", color: "#8A7794", padding: 30 }}>
+                Aún no hay pedidos festivos{filtroGradoFestivo !== "todos" ? " con ese filtro" : ""}.
+              </div>
+            )}
+            {festivoFiltrados.map((p) => (
+              <div key={p.id} style={tarjeta}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                  <div style={{ fontWeight: 900, fontSize: 15 }}>
+                    {p.nombre} {festivoCantidadTotal(p) > 1 ? `· x${festivoCantidadTotal(p)}` : ""}
+                    {p.grado && (
+                      <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 800, color: C.plum, background: C.lavSoft, padding: "2px 8px", borderRadius: 999 }}>
+                        {p.grado}
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontWeight: 900, color: C.plum }}>${totalFestivo(p)}</div>
+                    <div style={{ fontSize: 12, color: "#8A7794" }}>{p.pago}</div>
+                  </div>
+                </div>
+                {p.platillos && Object.entries(p.platillos).some(([, v]) => v > 0) && (
+                  <div style={{ fontSize: 12, color: "#7A6884", margin: "6px 0 0" }}>
+                    {Object.entries(p.platillos).filter(([, v]) => v > 0).map(([n, v]) => `${v} ${n}`).join(" · ")}
+                  </div>
+                )}
+                {p.notas && <div style={{ fontSize: 12, color: "#7A6884", margin: "8px 0" }}>{p.notas}</div>}
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={() => togglePagadoFestivo(p.id)} style={chip(p.pagado, C.ok)}>
+                    {p.pagado ? "✓ Pagado" : "Marcar pagado"}
+                  </button>
+                  <button onClick={() => editarFestivoPedido(p)} style={chip(false)}>Editar</button>
+                  <button onClick={() => borrarFestivoPedido(p.id)} style={{ ...chip(false), color: "#B0486B", borderColor: "#EFC5D2" }}>Borrar</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* ══ SEMANAS ANTERIORES ══ */}
+        {vista === "historial" && (
+          <div style={{ display: "grid", gap: 14 }}>
+            {!semanaAbierta ? (
+              <>
+                <h2 style={{ margin: "2px 0 0", fontSize: 17, fontWeight: 900, color: C.plum }}>Semanas anteriores 🗂️</h2>
+                {historial.length === 0 && (
+                  <div style={{ ...tarjeta, textAlign: "center", color: "#8A7794", padding: 30 }}>
+                    Aún no hay semanas archivadas. Se guardan automáticamente cuando tocas <b>Nueva semana</b> con pedidos capturados.
+                  </div>
+                )}
+                {historial.map((h) => {
+                  const c = calcularResumenSemana(h.menu, h.pedidos, h.clubPrecios, h.clubPedidos, h.menuFestivo, h.festivoPedidos);
+                  const pend = c.pendienteCobro + c.clubPendiente + c.festivoPendiente;
+                  return (
+                    <button key={h.id} onClick={() => { setSemanaAbierta(h.id); setTituloHist(null); }}
+                      style={{ ...tarjeta, textAlign: "left", cursor: "pointer", border: "none", display: "grid", gap: 4, width: "100%" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <span style={{ fontWeight: 900, fontSize: 15, color: C.ink }}>{h.semana}</span>
+                        <span style={{ fontWeight: 900, color: C.plum }}>${c.ingresoSemana + c.clubIngreso + c.festivoIngreso}</span>
+                      </div>
+                      <div style={{ fontSize: 12, color: "#8A7794" }}>
+                        Cerrada el {new Date(h.cerrada).toLocaleDateString("es-MX")} · {h.pedidos.length} desayuno · {h.clubPedidos.length} Club de Tareas · {(h.festivoPedidos || []).length} Festivo
+                        {pend > 0 ? ` · ⏳ por cobrar: $${pend}` : " · ✓ todo cobrado"}
+                      </div>
+                    </button>
+                  );
+                })}
+              </>
+            ) : (() => {
+              const h = historial.find((x) => x.id === semanaAbierta);
+              if (!h) return null;
+              const c = calcularResumenSemana(h.menu, h.pedidos, h.clubPrecios, h.clubPedidos, h.menuFestivo, h.festivoPedidos);
+              return (
+                <>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                    <button onClick={() => { setSemanaAbierta(null); setTituloHist(null); }} style={chip(false)}>← Semanas</button>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button onClick={() => descargarPDF(h.menu, c, h.clubPedidos, " (archivada)", h.festivoPedidos || [], h.menuFestivo || MENU_FESTIVO_INICIAL)}
+                        style={{ ...chip(false), borderColor: C.teal, color: "#3E7A6C" }}>
+                        📄 PDF
+                      </button>
+                      {(h.festivoPedidos || []).length > 0 && (
+                        <button onClick={() => descargarPDFFestivo(h.menuFestivo || MENU_FESTIVO_INICIAL, c, h.festivoPedidos || [], " (archivada)")}
+                          style={{ ...chip(false), borderColor: C.lavender, color: C.plum }}>
+                          📄 PDF Festivos
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  {tituloHist === null ? (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 4 }}>
+                      <h2 style={{ margin: 0, fontSize: 17, fontWeight: 900, color: C.plum }}>{h.semana}</h2>
+                      <button onClick={() => setTituloHist(h.semana)} style={{ ...chip(false), padding: "4px 10px", fontSize: 12 }}>✏️ Cambiar nombre</button>
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4 }}>
+                      <input style={{ ...inputS, flex: "1 1 220px" }} value={tituloHist} autoFocus
+                        onChange={(e) => setTituloHist(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") renombrarSemanaHistorial(h.id, tituloHist); }} />
+                      <button onClick={() => renombrarSemanaHistorial(h.id, tituloHist)} style={{ ...chip(true), padding: "10px 14px" }}>Guardar</button>
+                      <button onClick={() => setTituloHist(null)} style={{ ...chip(false), padding: "10px 14px" }}>Cancelar</button>
+                    </div>
+                  )}
+
+                  <div style={{ ...tarjeta, background: C.plum, color: C.white }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, opacity: 0.85 }}>Total de esa semana</div>
+                    <div style={{ fontSize: 24, fontWeight: 900 }}>${c.ingresoSemana + c.clubIngreso + c.festivoIngreso}</div>
+                    <div style={{ display: "flex", gap: 14, marginTop: 8, fontSize: 13, fontWeight: 700, flexWrap: "wrap" }}>
+                      <span>✅ Recaudado: ${c.recaudadoSemana + c.clubRecaudado + c.festivoRecaudado}</span>
+                      <span>⏳ Por cobrar: ${c.pendienteCobro + c.clubPendiente + c.festivoPendiente}</span>
+                    </div>
+                  </div>
+
+                  <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Pedidos de desayuno</div>
+                  {h.pedidos.length === 0 && <div style={{ ...tarjeta, color: "#8A7794", fontSize: 13 }}>Sin pedidos.</div>}
+                  {h.pedidos.map((p) => (
+                    <div key={p.id} style={tarjeta}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                        <div style={{ fontWeight: 900, fontSize: 14 }}>{p.nombre}{p.qty > 1 ? ` · x${p.qty}` : ""}</div>
+                        <div style={{ fontWeight: 900, color: C.plum }}>${c.totalPedido(p)}</div>
+                      </div>
+                      <div style={{ fontSize: 12, color: "#8A7794", margin: "6px 0" }}>
+                        {DIAS.filter(({ key }) => p.dias[key])
+                          .map(({ key, label }) => `${label.slice(0, 3)}: ${PAQUETES_TODOS.find((q) => q.key === p.dias[key])?.label || "Agua embotellada 500ml"}`)
+                          .join(" · ")}
+                      </div>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button onClick={() => toggleHistPagado(h.id, p.id)} style={chip(p.pagado, C.ok)}>
+                          {p.pagado ? "✓ Pagado" : "Marcar pagado"}
+                        </button>
+                        <button onClick={() => borrarHistPedido(h.id, p.id)} style={{ ...chip(false), color: "#B0486B", borderColor: "#EFC5D2" }}>Borrar</button>
+                      </div>
+                    </div>
+                  ))}
+
+                  <div style={{ fontSize: 13, fontWeight: 800, color: C.plum, marginTop: 6 }}>Pedidos Club de Tareas</div>
+                  {h.clubPedidos.length === 0 && <div style={{ ...tarjeta, color: "#8A7794", fontSize: 13 }}>Sin pedidos.</div>}
+                  {h.clubPedidos.map((p) => (
+                    <div key={p.id} style={tarjeta}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                        <div style={{ fontWeight: 900, fontSize: 14 }}>{p.nombre}</div>
+                        <div style={{ fontWeight: 900, color: C.plum }}>${c.totalClub(p)}</div>
+                      </div>
+                      <div style={{ fontSize: 12, color: "#8A7794", margin: "6px 0" }}>
+                        {CLUB_ITEMS.filter((it) => p.items?.[it.key] > 0).map((it) => `${p.items[it.key]} ${it.label}`).join(" · ")}
+                      </div>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button onClick={() => toggleHistPagadoClub(h.id, p.id)} style={chip(p.pagado, C.ok)}>
+                          {p.pagado ? "✓ Pagado" : "Marcar pagado"}
+                        </button>
+                        <button onClick={() => borrarHistClubPedido(h.id, p.id)} style={{ ...chip(false), color: "#B0486B", borderColor: "#EFC5D2" }}>Borrar</button>
+                      </div>
+                    </div>
+                  ))}
+
+                  <div style={{ fontSize: 13, fontWeight: 800, color: C.plum, marginTop: 6 }}>
+                    Pedidos Menú festivo{(h.festivoPedidos || []).length > 0 && h.menuFestivo?.nombre ? ` · ${h.menuFestivo.nombre}` : ""}
+                    {(h.festivoPedidos || []).length > 0 && h.menuFestivo?.fecha ? ` (${formatoFechaCorta(h.menuFestivo.fecha)})` : ""}
+                  </div>
+                  {(h.festivoPedidos || []).length > 0 && (() => {
+                    // Solo se puede mover a semanas que no tengan ya pedidos festivos (cada semana guarda un solo menú festivo)
+                    const destinos = [
+                      ...(festivoPedidos.length === 0 ? [{ id: "actual", nombre: `${menu.semana} (actual)` }] : []),
+                      ...historial.filter((x) => x.id !== h.id && !(x.festivoPedidos || []).length).map((x) => ({ id: x.id, nombre: x.semana })),
+                    ];
+                    if (!destinos.length) return null;
+                    return (
+                      <div style={{ ...tarjeta, display: "grid", gap: 6, background: C.lavSoft }}>
+                        <div style={{ fontSize: 12, color: "#6E5A78" }}>¿Estos festivos se entregaron en otra semana? Muévelos para que su ingreso se sume donde corresponde:</div>
+                        <select style={inputS} value="" onChange={(e) => e.target.value && moverFestivoHistorial(h.id, e.target.value)}>
+                          <option value="">Mover a la semana…</option>
+                          {destinos.map((d) => <option key={d.id} value={d.id}>{d.nombre}</option>)}
+                        </select>
+                      </div>
+                    );
+                  })()}
+                  {(h.festivoPedidos || []).length === 0 && <div style={{ ...tarjeta, color: "#8A7794", fontSize: 13 }}>Sin pedidos.</div>}
+                  {(h.festivoPedidos || []).map((p) => (
+                    <div key={p.id} style={tarjeta}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                        <div style={{ fontWeight: 900, fontSize: 14 }}>{p.nombre}</div>
+                        <div style={{ fontWeight: 900, color: C.plum }}>${c.totalFestivo(p)}</div>
+                      </div>
+                      <div style={{ fontSize: 12, color: "#8A7794", margin: "6px 0" }}>
+                        {p.platillos
+                          ? Object.entries(p.platillos).filter(([, v]) => v > 0).map(([n, v]) => `${v} ${n}`).join(" · ")
+                          : `x${p.qty || 1}`}
+                      </div>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button onClick={() => toggleHistPagadoFestivo(h.id, p.id)} style={chip(p.pagado, C.ok)}>
+                          {p.pagado ? "✓ Pagado" : "Marcar pagado"}
+                        </button>
+                        <button onClick={() => borrarHistFestivoPedido(h.id, p.id)} style={{ ...chip(false), color: "#B0486B", borderColor: "#EFC5D2" }}>Borrar</button>
+                      </div>
+                    </div>
+                  ))}
+
+                  <button onClick={() => borrarSemanaHistorial(h.id)}
+                    style={{ ...chip(false), color: "#B0486B", borderColor: "#EFC5D2", justifySelf: "start", marginTop: 6 }}>
+                    Borrar esta semana del historial
+                  </button>
+                </>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* ══ ESTADÍSTICA DE VENTAS ══ */}
+        {vista === "estadisticas" && (() => {
+          // Cada semana (archivadas + la actual) con sus totales
+          const semanasCronologicas = [
+            ...[...historial].reverse().map((h) => ({ id: h.id, nombre: h.semana, fecha: new Date(h.cerrada), menu: h.menu, pedidos: h.pedidos || [], clubPrecios: h.clubPrecios, clubPedidos: h.clubPedidos || [], menuFestivo: h.menuFestivo || MENU_FESTIVO_INICIAL, festivoPedidos: h.festivoPedidos || [], actual: false })),
+            { id: "actual", nombre: `${menu.semana} (actual)`, fecha: new Date(), menu, pedidos, clubPrecios, clubPedidos, menuFestivo, festivoPedidos, actual: true },
+          ];
+          const datosSemana = (s) => {
+            const c = calcularResumenSemana(s.menu, s.pedidos, s.clubPrecios, s.clubPedidos, s.menuFestivo, s.festivoPedidos);
+            const desayunos = DIAS.reduce((a, { key }) => a + c.resumenDia(key).desayunos, 0);
+            const menusFestivo = s.festivoPedidos.reduce((a, p) => a + festivoCantidadTotal(p), 0);
+            const clubPiezas = CLUB_ITEMS.reduce((a, it) => a + (c.clubCantidades[it.key] || 0), 0);
+            return {
+              desayuno: c.ingresoSemana, club: c.clubIngreso, festivo: c.festivoIngreso,
+              total: c.ingresoSemana + c.clubIngreso + c.festivoIngreso,
+              recaudado: c.recaudadoSemana + c.clubRecaudado + c.festivoRecaudado,
+              pendiente: c.pendienteCobro + c.clubPendiente + c.festivoPendiente,
+              efectivo: (c.porPago["Efectivo"] || 0) + (c.clubPorPago["Efectivo"] || 0) + (c.festivoPorPago["Efectivo"] || 0),
+              transferencia: (c.porPago["Transferencia"] || 0) + (c.clubPorPago["Transferencia"] || 0) + (c.festivoPorPago["Transferencia"] || 0),
+              tap: (c.porPago["Tap to Pay"] || 0) + (c.clubPorPago["Tap to Pay"] || 0) + (c.festivoPorPago["Tap to Pay"] || 0),
+              desayunos, clubPiezas, menusFestivo,
+              pedidos: s.pedidos.length + s.clubPedidos.length + s.festivoPedidos.length,
+              clubCantidades: { ...c.clubCantidades },
+            };
+          };
+          const sumar = (a, b) => {
+            const r = { ...a };
+            ["desayuno", "club", "festivo", "total", "recaudado", "pendiente", "efectivo", "transferencia", "tap", "desayunos", "clubPiezas", "menusFestivo", "pedidos"].forEach((k) => { r[k] = (a[k] || 0) + (b[k] || 0); });
+            r.clubCantidades = { ...(a.clubCantidades || {}) };
+            Object.entries(b.clubCantidades || {}).forEach(([k, v]) => { r.clubCantidades[k] = (r.clubCantidades[k] || 0) + v; });
+            r.semanas = (a.semanas || 0) + 1;
+            return r;
+          };
+
+          let periodos;
+          if (modoEstad === "semanal") {
+            periodos = semanasCronologicas.slice(-12).map((s) => ({
+              id: s.id, etiqueta: s.nombre, corta: s.actual ? "Actual" : s.fecha.toLocaleDateString("es-MX", { day: "2-digit", month: "short" }),
+              sub: s.actual ? "En curso" : `Cerrada el ${s.fecha.toLocaleDateString("es-MX")}`, datos: { ...datosSemana(s), semanas: 1 },
+            }));
+          } else {
+            const porMes = {};
+            semanasCronologicas.forEach((s) => {
+              const clave = `${s.fecha.getFullYear()}-${String(s.fecha.getMonth() + 1).padStart(2, "0")}`;
+              if (!porMes[clave]) porMes[clave] = { id: clave, fecha: s.fecha, datos: {} };
+              porMes[clave].datos = sumar(porMes[clave].datos, datosSemana(s));
+            });
+            periodos = Object.keys(porMes).sort().slice(-12).map((k) => {
+              const m = porMes[k];
+              const nombreMes = m.fecha.toLocaleDateString("es-MX", { month: "long", year: "numeric" });
+              return {
+                id: k, etiqueta: nombreMes.charAt(0).toUpperCase() + nombreMes.slice(1),
+                corta: m.fecha.toLocaleDateString("es-MX", { month: "short" }).replace(".", ""),
+                sub: `${m.datos.semanas} semana${m.datos.semanas === 1 ? "" : "s"}`, datos: m.datos,
+              };
+            });
+          }
+
+          const sel = periodos.find((p) => p.id === periodoSel) || periodos[periodos.length - 1];
+          const idxSel = periodos.indexOf(sel);
+          const anterior = idxSel > 0 ? periodos[idxSel - 1] : null;
+          const maximo = Math.max(1, ...periodos.map((p) => p.datos.total));
+          const promedio = periodos.length ? Math.round(periodos.reduce((a, p) => a + p.datos.total, 0) / periodos.length) : 0;
+          const mejor = periodos.reduce((m, p) => (!m || p.datos.total > m.datos.total ? p : m), null);
+          const variacion = anterior && anterior.datos.total > 0
+            ? Math.round(((sel.datos.total - anterior.datos.total) / anterior.datos.total) * 100) : null;
+          const unidad = modoEstad === "semanal" ? "semana" : "mes";
+          const pct = (v) => (sel.datos.total > 0 ? Math.round((v / sel.datos.total) * 100) : 0);
+          const topClub = CLUB_ITEMS.map((it) => ({ label: it.label, n: sel.datos.clubCantidades?.[it.key] || 0 }))
+            .filter((x) => x.n > 0).sort((a, b) => b.n - a.n).slice(0, 5);
+          const colores = { desayuno: C.plum, club: C.mustard, festivo: C.lavender };
+
+          return (
+            <div style={{ display: "grid", gap: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <h2 style={{ margin: "2px 0 0", fontSize: 17, fontWeight: 900, color: C.plum }}>Estadística de ventas 📈</h2>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button style={chip(modoEstad === "semanal")} onClick={() => { setModoEstad("semanal"); setPeriodoSel(null); }}>Semanal</button>
+                  <button style={chip(modoEstad === "mensual")} onClick={() => { setModoEstad("mensual"); setPeriodoSel(null); }}>Mensual</button>
+                </div>
+              </div>
+              <div style={{ fontSize: 12, color: "#8A7794", marginTop: -8 }}>
+                {modoEstad === "semanal"
+                  ? "Últimas 12 semanas (las archivadas en 'Semanas' + la actual). Toca una barra para ver su detalle."
+                  : "Cada semana se cuenta en el mes en que se cerró; la semana actual cuenta en el mes de hoy. Toca una barra para ver su detalle."}
+              </div>
+
+              {/* Tarjetas principales */}
+              <div style={{ ...tarjeta, background: C.plum, color: C.white }}>
+                <div style={{ fontSize: 13, fontWeight: 700, opacity: 0.85 }}>{sel.etiqueta}</div>
+                <div style={{ fontSize: 28, fontWeight: 900 }}>${sel.datos.total}</div>
+                <div style={{ display: "flex", gap: 14, marginTop: 6, fontSize: 13, fontWeight: 700, flexWrap: "wrap" }}>
+                  <span>✅ Recaudado: ${sel.datos.recaudado}</span>
+                  <span style={{ color: C.pink }}>⏳ Por cobrar: ${sel.datos.pendiente}</span>
+                  {variacion !== null && (
+                    <span style={{ background: "rgba(255,255,255,.18)", padding: "1px 8px", borderRadius: 999 }}>
+                      {variacion >= 0 ? "▲" : "▼"} {Math.abs(variacion)}% vs {unidad} anterior
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <div style={{ ...tarjeta, flex: "1 1 140px", padding: 12 }}>
+                  <div style={{ fontSize: 12, fontWeight: 800, color: "#8A7794" }}>Promedio por {unidad}</div>
+                  <div style={{ fontSize: 20, fontWeight: 900, color: C.plum }}>${promedio}</div>
+                </div>
+                <div style={{ ...tarjeta, flex: "1 1 140px", padding: 12 }}>
+                  <div style={{ fontSize: 12, fontWeight: 800, color: "#8A7794" }}>Mejor {unidad}</div>
+                  <div style={{ fontSize: 20, fontWeight: 900, color: C.plum }}>${mejor ? mejor.datos.total : 0}</div>
+                  <div style={{ fontSize: 11, color: "#8A7794" }}>{mejor ? mejor.etiqueta : "—"}</div>
+                </div>
+                <div style={{ ...tarjeta, flex: "1 1 140px", padding: 12 }}>
+                  <div style={{ fontSize: 12, fontWeight: 800, color: "#8A7794" }}>Pedidos en el periodo</div>
+                  <div style={{ fontSize: 20, fontWeight: 900, color: C.plum }}>{sel.datos.pedidos}</div>
+                </div>
+              </div>
+
+              {/* Gráfica de barras apiladas */}
+              <div style={tarjeta}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: C.plum, marginBottom: 10 }}>
+                  Ventas por {unidad}
+                </div>
+                <div style={{ display: "flex", gap: 12, fontSize: 11, fontWeight: 700, color: "#6E5A78", marginBottom: 10, flexWrap: "wrap" }}>
+                  <span><span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 3, background: colores.desayuno, marginRight: 4 }} />Desayunos</span>
+                  <span><span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 3, background: colores.club, marginRight: 4 }} />Club de Tareas</span>
+                  <span><span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 3, background: colores.festivo, marginRight: 4 }} />Festivo</span>
+                </div>
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 6, height: 180, overflowX: "auto", paddingBottom: 2 }}>
+                  {periodos.map((p) => {
+                    const alto = (v) => `${(v / maximo) * 140}px`;
+                    const activo = p.id === sel.id;
+                    return (
+                      <button key={p.id} onClick={() => setPeriodoSel(p.id)} title={`${p.etiqueta}: $${p.datos.total}`}
+                        style={{ flex: "1 0 38px", maxWidth: 70, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end", height: "100%", background: activo ? C.lavSoft : "transparent", border: "none", borderRadius: 10, padding: "4px 2px", cursor: "pointer" }}>
+                        <span style={{ fontSize: 10, fontWeight: 800, color: C.ink, marginBottom: 2 }}>${p.datos.total >= 1000 ? `${(p.datos.total / 1000).toFixed(1)}k` : p.datos.total}</span>
+                        <div style={{ width: "70%", display: "flex", flexDirection: "column-reverse", borderRadius: 6, overflow: "hidden", minHeight: 2 }}>
+                          <div style={{ height: alto(p.datos.desayuno), background: colores.desayuno }} />
+                          <div style={{ height: alto(p.datos.club), background: colores.club }} />
+                          <div style={{ height: alto(p.datos.festivo), background: colores.festivo }} />
+                        </div>
+                        <span style={{ fontSize: 10, fontWeight: activo ? 900 : 700, color: activo ? C.plum : "#8A7794", marginTop: 4, whiteSpace: "nowrap" }}>{p.corta}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Desglose del periodo seleccionado */}
+              <div style={{ ...tarjeta, display: "grid", gap: 10 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Desglose · {sel.etiqueta} <span style={{ fontWeight: 700, color: "#8A7794" }}>({sel.sub})</span></div>
+                {[
+                  ["🍳 Desayunos", sel.datos.desayuno, colores.desayuno, `${sel.datos.desayunos} desayunos`],
+                  ["🎒 Club de Tareas", sel.datos.club, colores.club, `${sel.datos.clubPiezas} artículos`],
+                  ["🎉 Menú festivo", sel.datos.festivo, colores.festivo, `${sel.datos.menusFestivo} menús`],
+                ].map(([t, v, col, det]) => (
+                  <div key={t}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 700 }}>
+                      <span>{t} <span style={{ color: "#8A7794", fontWeight: 600 }}>· {det}</span></span>
+                      <span style={{ fontWeight: 900, color: C.plum }}>${v} <span style={{ fontSize: 11, color: "#8A7794" }}>({pct(v)}%)</span></span>
+                    </div>
+                    <div style={{ height: 8, background: "#F1E9F4", borderRadius: 999, marginTop: 4 }}>
+                      <div style={{ width: `${pct(v)}%`, height: "100%", background: col, borderRadius: 999 }} />
+                    </div>
+                  </div>
+                ))}
+                <div style={{ borderTop: "1px solid #EADFF2", paddingTop: 8, display: "flex", gap: 14, flexWrap: "wrap", fontSize: 12, fontWeight: 800, color: "#6E5A78" }}>
+                  <span>💵 Efectivo ${sel.datos.efectivo}</span>
+                  <span>🏦 Transferencia ${sel.datos.transferencia}</span>
+                  <span>💳 Tap to Pay ${sel.datos.tap}</span>
+                </div>
+              </div>
+
+              {topClub.length > 0 && (
+                <div style={{ ...tarjeta, display: "grid", gap: 6 }}>
+                  <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Lo más vendido en Club de Tareas</div>
+                  {topClub.map((x, i) => (
+                    <div key={x.label} style={{ display: "flex", justifyContent: "space-between", fontSize: 14 }}>
+                      <span>{i + 1}. {x.label}</span>
+                      <span style={{ fontWeight: 800, color: C.plum }}>{x.n}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {historial.length === 0 && (
+                <div style={{ ...tarjeta, textAlign: "center", color: "#8A7794", fontSize: 13 }}>
+                  Por ahora solo se ve la semana actual. Cada vez que toques <b>Nueva semana</b>, la semana se archiva y se suma a esta estadística.
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* ══ MENÚ ══ */}
+        {vista === "menu" && (
+          <div style={{ display: "grid", gap: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <h2 style={{ margin: "2px 0 0", fontSize: 17, fontWeight: 900, color: C.plum }}>Menú de la semana ✏️</h2>
+              <button onClick={descargarMenuPNG} style={{ ...chip(false), borderColor: C.mustard, color: "#9C6B14" }}>
+                🖼️ Descargar menú (PNG, sin precios)
+              </button>
+            </div>
+            <div style={{ ...tarjeta, display: "grid", gap: 8 }}>
+              <label style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Nombre de la semana</label>
+              <input style={inputS} value={menu.semana} onChange={(e) => setMenu({ ...menu, semana: e.target.value })} />
+            </div>
+            {DIAS.map(({ key, label }) => (
+              <div key={key} style={{ ...tarjeta, display: "grid", gap: 8 }}>
+                <span style={etiquetaDia(key)}>{key === "mar" ? "Martes de tacos" : label}</span>
+                <input style={inputS} placeholder="Platillo" value={menu.platillos[key].plato}
+                  onChange={(e) => setMenu({ ...menu, platillos: { ...menu.platillos, [key]: { ...menu.platillos[key], plato: e.target.value } } })} />
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input style={inputS} placeholder="Postre" value={menu.platillos[key].postre}
+                    onChange={(e) => setMenu({ ...menu, platillos: { ...menu.platillos, [key]: { ...menu.platillos[key], postre: e.target.value } } })} />
+                  <input style={inputS} placeholder="Bebida" value={menu.platillos[key].bebida}
+                    onChange={(e) => setMenu({ ...menu, platillos: { ...menu.platillos, [key]: { ...menu.platillos[key], bebida: e.target.value } } })} />
+                </div>
+              </div>
+            ))}
+            <div style={{ ...tarjeta, display: "grid", gap: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Precios</div>
+              {[
+                ["solo", "Solo desayuno"], ["postre", "Desayuno y postre"],
+                ["completo", "Desayuno completo"], ["aguaBotella", "Agua embotellada 500 ml"], ["agua1L", "Agua 1 litro"], ["soloPostre", "Solo postre"],
+                ["lechita", "Lechita"], ["jugo500", "Jugo 500 ml"],
+              ].map(([k, t]) => (
+                <div key={k} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ flex: 1, fontSize: 14 }}>{t}</span>
+                  <span style={{ fontWeight: 800, color: C.plum }}>$</span>
+                  <input type="number" style={{ ...inputS, width: 80 }} value={menu.precios[k]}
+                    onChange={(e) => setMenu({ ...menu, precios: { ...menu.precios, [k]: Number(e.target.value) || 0 } })} />
+                </div>
+              ))}
+            </div>
+            <div style={{ ...tarjeta, display: "grid", gap: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>💳 Comisión de Tap to Pay</div>
+              <div style={{ fontSize: 12, color: "#8A7794" }}>
+                Cuando eliges "Tap to Pay" como forma de pago en Pedidos, Club o Menú festivo, este porcentaje se suma automáticamente al total que le cobras al cliente, para cubrir la comisión bancaria.
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ flex: 1, fontSize: 14 }}>Comisión</span>
+                <input type="number" min="0" max="100" step="0.1" style={{ ...inputS, width: 80 }} value={menu.precios.comisionTapToPay ?? 0}
+                  onChange={(e) => setMenu({ ...menu, precios: { ...menu.precios, comisionTapToPay: Number(e.target.value) || 0 } })} />
+                <span style={{ fontWeight: 800, color: C.plum }}>%</span>
+              </div>
+            </div>
+            <div style={{ ...tarjeta, display: "grid", gap: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>💳 Descuento por pago anticipado</div>
+              <div style={{ fontSize: 12, color: "#8A7794" }}>
+                Se aplica solo a los pedidos de desayuno semanal cuando marcas "Pago anticipado" al capturarlos.
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ flex: 1, fontSize: 14 }}>Descuento</span>
+                <input type="number" min="0" max="100" style={{ ...inputS, width: 80 }} value={menu.precios.descuentoAnticipado ?? 0}
+                  onChange={(e) => setMenu({ ...menu, precios: { ...menu.precios, descuentoAnticipado: Number(e.target.value) || 0 } })} />
+                <span style={{ fontWeight: 800, color: C.plum }}>%</span>
+              </div>
+            </div>
+            <button onClick={() => guardar(menu, null)} style={{ padding: "14px", borderRadius: 14, border: "none", background: C.plum, color: C.white, fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
+              Guardar menú
+            </button>
+
+            <h2 style={{ margin: "10px 0 0", fontSize: 17, fontWeight: 900, color: C.plum }}>🎒 Club de Tareas ✏️</h2>
+            <div style={{ ...tarjeta, display: "grid", gap: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Antojitos</div>
+              {CLUB_ARTICULOS.map((it) => (
+                <div key={it.key} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ flex: 1, fontSize: 14 }}>{it.label}</span>
+                  <span style={{ fontWeight: 800, color: C.plum }}>$</span>
+                  <input type="number" style={{ ...inputS, width: 80 }} value={clubPrecios[it.key] ?? 0}
+                    onChange={(e) => setClubPrecios({ ...clubPrecios, [it.key]: Number(e.target.value) || 0 })} />
+                </div>
+              ))}
+            </div>
+            <div style={{ ...tarjeta, display: "grid", gap: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Bebidas</div>
+              {CLUB_BEBIDAS.map((it) => (
+                <div key={it.key} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ flex: 1, fontSize: 14 }}>{it.label}</span>
+                  <span style={{ fontWeight: 800, color: C.plum }}>$</span>
+                  <input type="number" style={{ ...inputS, width: 80 }} value={clubPrecios[it.key] ?? 0}
+                    onChange={(e) => setClubPrecios({ ...clubPrecios, [it.key]: Number(e.target.value) || 0 })} />
+                </div>
+              ))}
+            </div>
+            <div style={{ ...tarjeta, display: "grid", gap: 8 }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: C.plum }}>Vaso 8oz</div>
+              {CLUB_VASOS.map((it) => (
+                <div key={it.key} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ flex: 1, fontSize: 14 }}>{it.label}</span>
+                  <span style={{ fontWeight: 800, color: C.plum }}>$</span>
+                  <input type="number" style={{ ...inputS, width: 80 }} value={clubPrecios[it.key] ?? 0}
+                    onChange={(e) => setClubPrecios({ ...clubPrecios, [it.key]: Number(e.target.value) || 0 })} />
+                </div>
+              ))}
+            </div>
+            <button onClick={() => guardar(null, null, clubPrecios, null)} style={{ padding: "14px", borderRadius: 14, border: "none", background: C.mustard, color: C.white, fontSize: 16, fontWeight: 900, cursor: "pointer" }}>
+              Guardar precios de Club de Tareas
+            </button>
+          </div>
+        )}
+      </main>
+
+      {/* ── Navegación inferior ── */}
+      <nav style={{ position: "fixed", bottom: 0, left: 0, right: 0, background: C.white, borderTop: `3px solid ${C.pinkSoft}`, display: "flex", justifyContent: "flex-start", gap: 4, padding: "8px 6px 12px", zIndex: 40, overflowX: "auto" }}>
+        {[
+          ["menu", "🗒️", "Menú"],
+          ["pedidos", "📋", "Pedidos"],
+          ["club", "🎒", "Club"],
+          ["resumen", "🍳", "Resumen"],
+          ["general", "📊", "General"],
+          ["festivo", "🎉", "Festivo"],
+          ["estadisticas", "📈", "Ventas"],
+          ["historial", "🗂️", "Semanas"],
+        ].map(([v, ico, t]) => (
+          <button key={v} onClick={() => setVista(v)}
+            style={{
+              flex: "0 0 auto", minWidth: 64, maxWidth: 120, padding: "8px 4px", borderRadius: 12, border: "none", cursor: "pointer",
+              background: vista === v ? C.lavSoft : "transparent",
+              color: vista === v ? C.plum : "#8A7794", fontWeight: 800, fontSize: 12,
+            }}>
+            <div style={{ fontSize: 18 }}>{ico}</div>
+            {t}
+          </button>
+        ))}
+      </nav>
+    </div>
+  );
+}
+
+// ── Componentes pequeños ──
+function Dato({ n, t, c }) {
+  return (
+    <div style={{ background: c + "33", border: `2px solid ${c}`, borderRadius: 12, padding: "6px 12px", minWidth: 74, textAlign: "center" }}>
+      <div style={{ fontSize: 20, fontWeight: 900, color: "#3A2B3F" }}>{n}</div>
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#6E5A78" }}>{t}</div>
+    </div>
+  );
+}
+
+function Contador({ label, value, onChange }) {
+  const b = { width: 30, height: 30, borderRadius: 8, border: "2px solid #E9DCEF", background: "#FFF", fontWeight: 900, cursor: "pointer", color: "#8B1E5B" };
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <span style={{ fontSize: 13, fontWeight: 700 }}>{label}</span>
+      <button style={b} onClick={() => onChange(Math.max(0, value - 1))}>−</button>
+      <span style={{ fontWeight: 900, minWidth: 18, textAlign: "center" }}>{value}</span>
+      <button style={b} onClick={() => onChange(value + 1)}>+</button>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<DeliLunch />);
+</script>
+</body>
+</html>
